@@ -34,6 +34,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>VertCut · Нарезка видео и автосубтитры</title>
 
+  <!-- Inline SVG-favicon (градиентный «V»), чтобы не получать 404 на /favicon.ico -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23e63950'/%3E%3Cstop offset='1' stop-color='%23ff8c42'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath d='M16 18 L32 46 L48 18' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E" />
+
   <!-- Google Fonts: Syne (заголовки), Outfit (UI), JetBrains Mono (цифры/таймкоды) -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -197,35 +200,53 @@
     }
 
     .dropzone {
-      border: 2px dashed var(--border-strong);
-      border-radius: 18px;
-      padding: 48px 24px;
+      display: block;
+      max-width: 720px;
+      margin: 0 auto;
+      border: 2px dashed rgba(255, 255, 255, 0.28);
+      border-radius: 20px;
+      padding: 56px 28px;
       text-align: center;
-      transition: all 0.25s ease;
-      background: rgba(255,255,255,0.02);
+      transition: border-color 0.25s ease, background 0.25s ease, transform 0.25s ease, box-shadow 0.25s ease;
+      background:
+        radial-gradient(600px 200px at 50% -10%, rgba(230, 57, 80, 0.08), transparent 70%),
+        rgba(255, 255, 255, 0.035);
       cursor: pointer;
       position: relative;
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
     }
     .dropzone:hover {
-      border-color: rgba(230, 57, 80, 0.6);
-      background: rgba(230, 57, 80, 0.04);
+      border-color: rgba(230, 57, 80, 0.7);
+      background:
+        radial-gradient(600px 200px at 50% -10%, rgba(230, 57, 80, 0.16), transparent 70%),
+        rgba(230, 57, 80, 0.05);
     }
     .dropzone.is-dragover {
       border-color: var(--accent);
-      background: rgba(230, 57, 80, 0.08);
+      background:
+        radial-gradient(600px 200px at 50% -10%, rgba(230, 57, 80, 0.22), transparent 70%),
+        rgba(230, 57, 80, 0.09);
       transform: scale(1.01);
-      box-shadow: 0 0 0 8px rgba(230, 57, 80, 0.06);
+      box-shadow: 0 0 0 8px rgba(230, 57, 80, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.04);
     }
     .dropzone-icon {
-      width: 64px; height: 64px; margin: 0 auto 14px;
+      width: 72px; height: 72px; margin: 0 auto 16px;
       border-radius: 50%; display: grid; place-items: center;
       background: var(--grad);
-      color: white; font-size: 28px;
-      box-shadow: 0 12px 32px rgba(230, 57, 80, 0.35);
+      color: white; font-size: 30px; font-weight: 700;
+      box-shadow: 0 14px 38px rgba(230, 57, 80, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.25);
     }
-    .dropzone h3 { margin: 0 0 6px; font-size: 22px; }
+    .dropzone h3 { margin: 0 0 6px; font-size: 22px; color: var(--text); }
     .dropzone p { margin: 0; color: var(--text-dim); }
-    .dropzone .formats { font-size: 12px; color: var(--text-mute); margin-top: 12px; }
+    .dropzone .formats {
+      display: inline-block;
+      margin-top: 14px; padding: 4px 10px;
+      font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--text-mute);
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+    }
     .dropzone input[type=file] { display: none; }
 
     .preview-grid {
