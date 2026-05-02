@@ -1,0 +1,2926 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  VertCut — автоматическая нарезка видео и автосубтитры в браузере
+  ============================================================================
+
+  Один файл (HTML + CSS + JS), без сборщиков и фреймворков.
+  Используется FFmpeg.wasm v0.11.6 (через CDN) и Whisper через Transformers.js
+  (@xenova/transformers v2.17.2). Вся обработка происходит в браузере, файлы
+  никуда не уходят.
+
+  --------------------------------------------------------------------------
+  ЗАПУСК
+  --------------------------------------------------------------------------
+  FFmpeg.wasm требует поддержки SharedArrayBuffer. Для этого страница должна
+  отдаваться с заголовками:
+      Cross-Origin-Opener-Policy:   same-origin
+      Cross-Origin-Embedder-Policy: require-corp
+
+  Самый простой способ — Node.js однострочник (положить index.html рядом):
+      node -e "require('http').createServer((req,res)=>{res.setHeader('Cross-Origin-Opener-Policy','same-origin');res.setHeader('Cross-Origin-Embedder-Policy','require-corp');res.writeHead(200);require('fs').createReadStream('index.html').pipe(res)}).listen(8080)"
+
+  Альтернатива — npx serve с нужными заголовками (через простой конфиг)
+  или любой статический сервер с возможностью установить COOP/COEP.
+
+  Обычный `python -m http.server 8080` НЕ ПОДОЙДЁТ — он не выставляет нужные
+  заголовки. Если запустить index.html напрямую (file://) или с обычного
+  сервера — приложение покажет экран-заглушку с инструкцией.
+  ============================================================================
+-->
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VertCut · Нарезка видео и автосубтитры</title>
+
+  <!-- Google Fonts: Syne (заголовки), Outfit (UI), JetBrains Mono (цифры/таймкоды) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Syne:wght@800&family=Outfit:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet"
+  />
+
+  <style>
+    /* ======================================================================
+       БАЗА И СБРОС
+       ====================================================================== */
+    *, *::before, *::after { box-sizing: border-box; }
+
+    :root {
+      --bg: #080810;
+      --bg-2: #0e0e1a;
+      --surface: rgba(255, 255, 255, 0.05);
+      --surface-2: rgba(255, 255, 255, 0.08);
+      --surface-3: rgba(255, 255, 255, 0.12);
+      --border: rgba(255, 255, 255, 0.1);
+      --border-strong: rgba(255, 255, 255, 0.2);
+      --text: #f1f1f5;
+      --text-dim: #a4a4b0;
+      --text-mute: #6b6b78;
+      --accent: #e63950;
+      --accent-2: #ff8c42;
+      --grad: linear-gradient(135deg, #e63950 0%, #ff8c42 100%);
+      --ok: #2dd4bf;
+      --warn: #f5c54a;
+      --err: #ff5b6b;
+      --shadow-lg: 0 20px 50px rgba(0, 0, 0, 0.5);
+      --radius: 14px;
+      --radius-sm: 8px;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: radial-gradient(1200px 800px at 80% -10%, rgba(230, 57, 80, 0.12), transparent 60%),
+                  radial-gradient(900px 600px at -10% 110%, rgba(255, 140, 66, 0.10), transparent 60%),
+                  var(--bg);
+      color: var(--text);
+      font-family: 'Outfit', system-ui, -apple-system, sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    button { font-family: inherit; cursor: pointer; }
+    input, select, textarea { font-family: inherit; }
+    a { color: inherit; }
+
+    code, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+    h1, h2, h3 { font-family: 'Syne', 'Outfit', sans-serif; font-weight: 800; letter-spacing: -0.01em; }
+
+    /* ======================================================================
+       ЛЭЙАУТ
+       ====================================================================== */
+    .app-wrap {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 28px 24px 80px;
+    }
+
+    .app-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 28px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .brand-mark {
+      width: 38px; height: 38px; border-radius: 10px;
+      background: var(--grad);
+      box-shadow: 0 8px 24px rgba(230, 57, 80, 0.4);
+      display: grid; place-items: center;
+      font-family: 'Syne', sans-serif; font-weight: 800;
+      color: white;
+    }
+    .brand-name {
+      font-family: 'Syne', sans-serif; font-weight: 800; font-size: 22px;
+      letter-spacing: 0.02em;
+    }
+    .brand-sub {
+      color: var(--text-dim); font-size: 13px; margin-top: 2px;
+    }
+
+    .stepper {
+      display: flex; align-items: center; gap: 10px;
+      color: var(--text-dim); font-size: 13px;
+    }
+    .stepper .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: rgba(255,255,255,0.12);
+      transition: all 0.25s ease;
+    }
+    .stepper .dot.active { background: var(--accent); transform: scale(1.4); }
+    .stepper .dot.done { background: var(--accent-2); }
+
+    /* ======================================================================
+       ЭКРАНЫ
+       ====================================================================== */
+    .screen {
+      display: none;
+      opacity: 0;
+      transform: translateY(20px);
+      transition: opacity 0.35s ease, transform 0.35s ease;
+    }
+    .screen.is-active {
+      display: block;
+    }
+    .screen.is-visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+
+    .panel-title {
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin: 0 0 14px;
+    }
+
+    /* ======================================================================
+       ЭКРАН 1: ЗАГРУЗКА
+       ====================================================================== */
+    .hero {
+      text-align: center;
+      margin-bottom: 28px;
+    }
+    .hero h1 {
+      font-size: clamp(32px, 5vw, 48px);
+      margin: 0 0 10px;
+      background: var(--grad);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .hero p {
+      color: var(--text-dim); margin: 0 auto; max-width: 620px;
+    }
+
+    .dropzone {
+      border: 2px dashed var(--border-strong);
+      border-radius: 18px;
+      padding: 48px 24px;
+      text-align: center;
+      transition: all 0.25s ease;
+      background: rgba(255,255,255,0.02);
+      cursor: pointer;
+      position: relative;
+    }
+    .dropzone:hover {
+      border-color: rgba(230, 57, 80, 0.6);
+      background: rgba(230, 57, 80, 0.04);
+    }
+    .dropzone.is-dragover {
+      border-color: var(--accent);
+      background: rgba(230, 57, 80, 0.08);
+      transform: scale(1.01);
+      box-shadow: 0 0 0 8px rgba(230, 57, 80, 0.06);
+    }
+    .dropzone-icon {
+      width: 64px; height: 64px; margin: 0 auto 14px;
+      border-radius: 50%; display: grid; place-items: center;
+      background: var(--grad);
+      color: white; font-size: 28px;
+      box-shadow: 0 12px 32px rgba(230, 57, 80, 0.35);
+    }
+    .dropzone h3 { margin: 0 0 6px; font-size: 22px; }
+    .dropzone p { margin: 0; color: var(--text-dim); }
+    .dropzone .formats { font-size: 12px; color: var(--text-mute); margin-top: 12px; }
+    .dropzone input[type=file] { display: none; }
+
+    .preview-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+      gap: 20px;
+      margin-top: 20px;
+    }
+    @media (max-width: 800px) { .preview-grid { grid-template-columns: 1fr; } }
+
+    .preview-video video {
+      width: 100%; max-height: 460px; border-radius: var(--radius);
+      background: #000; display: block;
+    }
+    .meta-list { list-style: none; padding: 0; margin: 0; }
+    .meta-list li {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid var(--border);
+    }
+    .meta-list li:last-child { border-bottom: none; }
+    .meta-list .k { color: var(--text-dim); font-size: 13px; }
+    .meta-list .v { font-family: 'JetBrains Mono', monospace; font-size: 14px; }
+
+    /* ======================================================================
+       ЭКРАН 2: НАСТРОЙКИ
+       ====================================================================== */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 20px;
+    }
+    @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+
+    .pill-row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .pill {
+      flex: 1 1 0; min-width: 80px;
+      padding: 14px 12px; text-align: center;
+      border: 1px solid var(--border);
+      background: var(--surface);
+      border-radius: var(--radius-sm);
+      transition: all 0.18s ease;
+      cursor: pointer; user-select: none;
+      font-weight: 600;
+    }
+    .pill:hover { border-color: var(--border-strong); transform: translateY(-1px); }
+    .pill.is-active {
+      border-color: transparent;
+      background: var(--grad);
+      color: white;
+      box-shadow: 0 8px 24px rgba(230, 57, 80, 0.25);
+    }
+    .pill .sub { display: block; font-size: 11px; opacity: 0.8; margin-top: 2px; font-weight: 400; }
+
+    .slider-row {
+      display: flex; align-items: center; gap: 14px;
+    }
+    input[type=range] {
+      -webkit-appearance: none; appearance: none;
+      flex: 1; height: 6px; border-radius: 3px;
+      background: var(--surface-3);
+      outline: none;
+    }
+    input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 18px; height: 18px; border-radius: 50%;
+      background: var(--grad);
+      cursor: pointer; border: 2px solid var(--bg);
+      box-shadow: 0 4px 10px rgba(230, 57, 80, 0.5);
+    }
+    input[type=range]::-moz-range-thumb {
+      width: 18px; height: 18px; border-radius: 50%;
+      background: #ff8c42; cursor: pointer; border: 2px solid var(--bg);
+    }
+    .slider-val {
+      min-width: 36px; text-align: right;
+      font-family: 'JetBrains Mono', monospace; font-size: 14px;
+      color: var(--text);
+    }
+
+    .toggle {
+      display: inline-flex; align-items: center; gap: 10px;
+      cursor: pointer; user-select: none;
+    }
+    .toggle input { position: absolute; opacity: 0; pointer-events: none; }
+    .toggle .switch {
+      width: 38px; height: 22px; background: var(--surface-3);
+      border-radius: 12px; position: relative;
+      transition: all 0.2s ease;
+    }
+    .toggle .switch::after {
+      content: ''; position: absolute; left: 3px; top: 3px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: white; transition: all 0.2s ease;
+    }
+    .toggle input:checked + .switch { background: var(--grad); }
+    .toggle input:checked + .switch::after { left: 19px; }
+
+    .aspect-toggle {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 6px;
+    }
+    .aspect-opt {
+      padding: 14px 12px; text-align: center; cursor: pointer; user-select: none;
+      border-radius: 8px; transition: all 0.18s ease;
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+    }
+    .aspect-opt:hover { background: rgba(255,255,255,0.04); }
+    .aspect-opt.is-active { background: var(--grad); color: white; }
+    .aspect-icon {
+      width: 36px; height: 28px; background: rgba(255,255,255,0.6);
+      border-radius: 4px;
+    }
+    .aspect-opt.is-active .aspect-icon { background: rgba(255,255,255,0.95); }
+    .aspect-icon.v { width: 18px; height: 32px; }
+
+    .strategy-card {
+      display: flex; align-items: flex-start; gap: 12px;
+      padding: 14px; border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: pointer; transition: all 0.18s ease;
+      background: var(--surface);
+    }
+    .strategy-card + .strategy-card { margin-top: 10px; }
+    .strategy-card:hover { border-color: var(--border-strong); }
+    .strategy-card.is-active {
+      border-color: var(--accent);
+      background: rgba(230, 57, 80, 0.08);
+    }
+    .strategy-radio {
+      width: 18px; height: 18px; border-radius: 50%;
+      border: 2px solid var(--border-strong);
+      flex-shrink: 0; margin-top: 2px; position: relative;
+    }
+    .strategy-card.is-active .strategy-radio {
+      border-color: var(--accent);
+    }
+    .strategy-card.is-active .strategy-radio::after {
+      content: ''; position: absolute; inset: 3px;
+      background: var(--accent); border-radius: 50%;
+    }
+    .strategy-title { font-weight: 600; }
+    .strategy-desc { color: var(--text-dim); font-size: 13px; margin-top: 2px; }
+
+    .timeline {
+      position: relative; height: 64px; margin-top: 10px;
+      background: rgba(255,255,255,0.04);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: crosshair;
+      overflow: hidden;
+    }
+    .timeline-track {
+      position: absolute; left: 0; right: 0; top: 50%; height: 4px;
+      background: linear-gradient(90deg, rgba(255,255,255,0.08), rgba(255,255,255,0.18), rgba(255,255,255,0.08));
+      transform: translateY(-50%);
+    }
+    .timeline-marker {
+      position: absolute; top: 0; bottom: 0; width: 2px;
+      background: var(--accent);
+      pointer-events: none;
+    }
+    .timeline-marker::after {
+      content: attr(data-i); position: absolute; top: 4px; left: 4px;
+      font-family: 'JetBrains Mono', monospace; font-size: 11px;
+      background: var(--accent); color: white; padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .timeline-marker .rm {
+      position: absolute; bottom: 4px; right: -10px;
+      width: 18px; height: 18px; border-radius: 50%;
+      background: rgba(0,0,0,0.7); color: white; font-size: 11px;
+      display: grid; place-items: center; cursor: pointer;
+      pointer-events: auto;
+    }
+
+    .warn-banner {
+      margin-top: 14px; padding: 12px 14px;
+      background: rgba(245, 197, 74, 0.1);
+      border: 1px solid rgba(245, 197, 74, 0.3);
+      border-radius: var(--radius-sm);
+      color: #ffd97a;
+      font-size: 13px;
+      display: none;
+    }
+    .warn-banner.is-visible { display: block; }
+
+    /* ----- Субтитры: панель оформления ----- */
+    .subs-block {
+      display: none; margin-top: 16px;
+    }
+    .subs-block.is-visible { display: block; }
+
+    .field-row {
+      display: flex; align-items: center; gap: 14px; margin: 12px 0;
+    }
+    .field-row label.k {
+      min-width: 130px; color: var(--text-dim); font-size: 13px;
+    }
+
+    .seg {
+      display: inline-flex; background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 4px;
+    }
+    .seg button {
+      background: transparent; color: var(--text-dim);
+      border: none; padding: 8px 12px; border-radius: 6px;
+      font-size: 13px; font-weight: 500;
+    }
+    .seg button.is-active {
+      background: var(--surface-3); color: var(--text);
+    }
+
+    select.input, input.input, textarea.input {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 8px 10px; color: var(--text);
+      font-size: 14px; outline: none;
+    }
+    select.input:focus, input.input:focus, textarea.input:focus {
+      border-color: var(--accent);
+    }
+    input[type=color] {
+      width: 36px; height: 36px; border-radius: 6px;
+      border: 1px solid var(--border);
+      background: transparent; padding: 0; cursor: pointer;
+    }
+    input[type=color]::-webkit-color-swatch-wrapper { padding: 2px; }
+    input[type=color]::-webkit-color-swatch { border-radius: 4px; border: none; }
+
+    .preset-row { display: flex; gap: 8px; flex-wrap: wrap; }
+    .preset-btn {
+      padding: 8px 14px; border-radius: 999px;
+      border: 1px solid var(--border);
+      background: var(--surface); color: var(--text);
+      font-size: 13px; font-weight: 600;
+      transition: all 0.18s ease;
+    }
+    .preset-btn:hover {
+      border-color: var(--accent); transform: translateY(-1px);
+    }
+
+    /* Превью субтитров */
+    .preview-stage {
+      position: relative; aspect-ratio: 16/9;
+      background: #000;
+      border-radius: var(--radius-sm); overflow: hidden;
+      display: grid; place-items: center;
+    }
+    .preview-stage video {
+      position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain;
+    }
+    .preview-sub {
+      position: absolute; left: 50%;
+      transform: translateX(-50%);
+      max-width: 90%;
+      text-align: center;
+      pointer-events: none;
+      transition: all 0.2s ease;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+
+    /* ======================================================================
+       ЭКРАН 3: ОБРАБОТКА
+       ====================================================================== */
+    .progress-card {
+      max-width: 720px; margin: 0 auto;
+      padding: 28px;
+    }
+    .phase {
+      display: grid; grid-template-columns: auto 1fr auto;
+      gap: 12px; align-items: center;
+      padding: 12px 0; border-bottom: 1px solid var(--border);
+    }
+    .phase:last-child { border-bottom: none; }
+    .phase-num {
+      width: 28px; height: 28px; border-radius: 50%;
+      background: var(--surface-3); color: var(--text-dim);
+      display: grid; place-items: center;
+      font-family: 'JetBrains Mono', monospace; font-size: 13px; font-weight: 600;
+    }
+    .phase.is-active .phase-num { background: var(--grad); color: white; }
+    .phase.is-done .phase-num { background: var(--ok); color: white; }
+    .phase-name { font-size: 14px; }
+    .phase-name .meta {
+      color: var(--text-dim); font-size: 12px; font-family: 'JetBrains Mono', monospace;
+    }
+    .phase-pct {
+      font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--text-dim);
+      min-width: 44px; text-align: right;
+    }
+
+    .progress-bar {
+      height: 6px; background: var(--surface-3); border-radius: 3px;
+      overflow: hidden; margin-top: 8px;
+    }
+    .progress-bar > div {
+      height: 100%; background: var(--grad);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .total-bar {
+      height: 8px; margin: 18px 0 0;
+    }
+    .total-bar > div {
+      box-shadow: 0 0 18px rgba(230, 57, 80, 0.5);
+    }
+
+    /* ======================================================================
+       ЭКРАН 4: РЕЗУЛЬТАТЫ
+       ====================================================================== */
+    .results-toolbar {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
+    }
+    .gallery {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 18px;
+    }
+    .clip-card {
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius); overflow: hidden;
+      display: flex; flex-direction: column;
+      animation: cardIn 0.5s ease both;
+      animation-delay: calc(var(--i, 0) * 80ms);
+    }
+    @keyframes cardIn {
+      from { opacity: 0; transform: translateY(20px) scale(0.98); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    .clip-video-wrap {
+      position: relative; aspect-ratio: 9/16; background: #000;
+    }
+    .clip-video-wrap.h-mode { aspect-ratio: 16/9; }
+    .clip-video-wrap video {
+      width: 100%; height: 100%; object-fit: contain; display: block;
+    }
+    .clip-tag {
+      position: absolute; left: 10px; top: 10px;
+      background: rgba(0,0,0,0.6);
+      backdrop-filter: blur(6px);
+      padding: 4px 8px; border-radius: 999px;
+      font-size: 11px; color: white;
+    }
+    .clip-body { padding: 14px; display: flex; flex-direction: column; gap: 10px; }
+    .clip-meta {
+      display: flex; align-items: center; justify-content: space-between;
+      font-family: 'JetBrains Mono', monospace; font-size: 12px;
+      color: var(--text-dim);
+    }
+    .clip-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+    .clip-actions .btn { padding: 8px 12px; font-size: 13px; }
+    .clip-error {
+      padding: 12px; background: rgba(255, 91, 107, 0.08);
+      border: 1px solid rgba(255, 91, 107, 0.3);
+      color: #ffb3bb; border-radius: var(--radius-sm);
+      font-size: 13px;
+    }
+    .clip-no-speech {
+      padding: 8px 10px; background: rgba(245, 197, 74, 0.08);
+      color: #ffd97a; border-radius: var(--radius-sm);
+      font-size: 12px;
+    }
+
+    /* ======================================================================
+       КНОПКИ
+       ====================================================================== */
+    .btn {
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 12px 18px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 14px; font-weight: 600;
+      transition: all 0.18s ease;
+      text-decoration: none;
+    }
+    .btn:hover { background: var(--surface-2); transform: translateY(-1px); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-primary {
+      background: var(--grad); border-color: transparent; color: white;
+      box-shadow: 0 12px 32px rgba(230, 57, 80, 0.35);
+    }
+    .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 16px 40px rgba(230, 57, 80, 0.45); }
+    .btn-primary.is-pulse { animation: pulse 1.4s ease-in-out infinite; }
+    @keyframes pulse {
+      0%, 100% { box-shadow: 0 12px 32px rgba(230, 57, 80, 0.35); }
+      50%      { box-shadow: 0 12px 32px rgba(230, 57, 80, 0.7); }
+    }
+    .btn-ghost { background: transparent; border-color: var(--border-strong); }
+    .btn-danger { color: #ffb3bb; border-color: rgba(255, 91, 107, 0.4); }
+    .btn-row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 18px; }
+    .btn-row.right { justify-content: flex-end; }
+
+    /* ======================================================================
+       ТОСТЫ
+       ====================================================================== */
+    .toast-stack {
+      position: fixed; right: 20px; bottom: 20px;
+      display: flex; flex-direction: column; gap: 10px;
+      z-index: 100;
+      max-width: 360px;
+    }
+    .toast {
+      padding: 12px 14px;
+      background: var(--bg-2);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-lg);
+      font-size: 14px;
+      animation: toastIn 0.3s ease;
+      display: flex; gap: 10px; align-items: flex-start;
+    }
+    .toast.t-ok    { border-left: 3px solid var(--ok); }
+    .toast.t-warn  { border-left: 3px solid var(--warn); }
+    .toast.t-err   { border-left: 3px solid var(--err); }
+    @keyframes toastIn {
+      from { opacity: 0; transform: translateX(60px); }
+      to   { opacity: 1; transform: translateX(0); }
+    }
+
+    /* ======================================================================
+       МОДАЛКА: РЕДАКТОР SRT
+       ====================================================================== */
+    .modal-bg {
+      position: fixed; inset: 0;
+      background: rgba(8, 8, 16, 0.7);
+      backdrop-filter: blur(6px);
+      display: none;
+      align-items: center; justify-content: center;
+      z-index: 200; padding: 24px;
+    }
+    .modal-bg.is-open { display: flex; }
+    .modal {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      width: 100%; max-width: 720px;
+      max-height: 90vh; overflow: hidden;
+      display: flex; flex-direction: column;
+      box-shadow: var(--shadow-lg);
+    }
+    .modal-head {
+      padding: 18px 22px;
+      border-bottom: 1px solid var(--border);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .modal-body { padding: 18px 22px; overflow-y: auto; flex: 1; }
+    .modal-foot {
+      padding: 14px 22px; border-top: 1px solid var(--border);
+      display: flex; justify-content: flex-end; gap: 10px; align-items: center;
+    }
+    .srt-row {
+      display: grid; grid-template-columns: auto 1fr; gap: 12px;
+      padding: 10px 0; border-bottom: 1px dashed var(--border);
+      align-items: start;
+    }
+    .srt-row:last-child { border-bottom: none; }
+    .srt-time {
+      font-family: 'JetBrains Mono', monospace; font-size: 12px;
+      color: var(--text-dim);
+      white-space: nowrap;
+    }
+    .srt-text {
+      width: 100%; min-height: 36px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); color: var(--text);
+      padding: 8px 10px; font-family: inherit; font-size: 14px;
+      resize: vertical;
+    }
+
+    /* ======================================================================
+       FALLBACK (нет SharedArrayBuffer)
+       ====================================================================== */
+    #fallback {
+      display: none;
+      max-width: 720px; margin: 60px auto; padding: 30px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    #fallback h1 {
+      background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    #fallback pre {
+      background: var(--bg); border: 1px solid var(--border);
+      padding: 12px; border-radius: var(--radius-sm);
+      overflow-x: auto;
+      font-family: 'JetBrains Mono', monospace; font-size: 12px;
+      color: #ffd97a;
+    }
+
+    /* ======================================================================
+       МЕЛОЧИ
+       ====================================================================== */
+    .row-between { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+    .gap-8 { gap: 8px; }
+    .muted { color: var(--text-dim); }
+    .small { font-size: 13px; }
+    .sep { height: 1px; background: var(--border); margin: 16px 0; }
+    .badge {
+      display: inline-block; padding: 2px 8px; border-radius: 999px;
+      font-size: 11px; background: var(--surface-3); color: var(--text-dim);
+    }
+    .badge.ok { background: rgba(45, 212, 191, 0.12); color: var(--ok); }
+    .badge.warn { background: rgba(245, 197, 74, 0.12); color: var(--warn); }
+
+    .field-grid {
+      display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    @media (max-width: 720px) { .field-grid { grid-template-columns: 1fr; } }
+
+    .hidden { display: none !important; }
+
+    /* Прогресс-бар Whisper модели */
+    .model-pill {
+      display: inline-flex; align-items: center; gap: 8px;
+      background: var(--surface); border: 1px solid var(--border);
+      padding: 6px 10px; border-radius: 999px; font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    /* Маленькие иконки-переключатели на карточках */
+    .icon-btn {
+      width: 34px; height: 34px; border-radius: 50%;
+      display: grid; place-items: center;
+      background: var(--surface-2); border: 1px solid var(--border);
+      color: var(--text-dim); cursor: pointer;
+      transition: all 0.18s ease;
+    }
+    .icon-btn:hover { background: var(--surface-3); color: var(--text); }
+    .icon-btn.is-on {
+      background: var(--grad); color: white; border-color: transparent;
+    }
+
+    .style-grid {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 18px;
+    }
+    @media (max-width: 800px) { .style-grid { grid-template-columns: 1fr; } }
+
+    .check-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 0;
+    }
+
+    /* Чтобы color-input выглядел приятнее */
+    .color-pair { display: inline-flex; align-items: center; gap: 8px; }
+    .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <!-- =====================================================================
+       FALLBACK
+       ===================================================================== -->
+  <div id="fallback">
+    <h1>Браузер не поддерживает требуемые возможности</h1>
+    <p>
+      Для работы FFmpeg.wasm и Whisper нужен <code>SharedArrayBuffer</code>.
+      Он включается, когда страница отдаётся со специальными HTTP-заголовками
+      <code>Cross-Origin-Opener-Policy: same-origin</code> и
+      <code>Cross-Origin-Embedder-Policy: require-corp</code>.
+    </p>
+
+    <h3>Самый простой запуск (Node.js)</h3>
+    <p>Положите <code>index.html</code> в любую папку и запустите рядом:</p>
+    <pre>node -e "require('http').createServer((req,res)=&gt;{res.setHeader('Cross-Origin-Opener-Policy','same-origin');res.setHeader('Cross-Origin-Embedder-Policy','require-corp');res.writeHead(200);require('fs').createReadStream('index.html').pipe(res)}).listen(8080)"</pre>
+    <p>Откройте <a href="http://localhost:8080" target="_blank">http://localhost:8080</a>.</p>
+
+    <h3>Альтернатива: <code>npx serve</code> с конфигом</h3>
+    <p>Создайте файл <code>serve.json</code> рядом с <code>index.html</code>:</p>
+    <pre>{
+  "headers": [
+    {
+      "source": "**/*",
+      "headers": [
+        { "key": "Cross-Origin-Opener-Policy",   "value": "same-origin" },
+        { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
+      ]
+    }
+  ]
+}</pre>
+    <p>И запустите: <code>npx serve --cors -l 8080</code>.</p>
+
+    <h3>Что не подойдёт</h3>
+    <p>
+      <code>python -m http.server 8080</code> и большинство простых статических
+      серверов не выставляют COOP/COEP, поэтому <code>SharedArrayBuffer</code>
+      будет недоступен.
+    </p>
+  </div>
+
+  <!-- =====================================================================
+       APP
+       ===================================================================== -->
+  <div class="app-wrap" id="app">
+
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark">V</div>
+        <div>
+          <div class="brand-name">VertCut</div>
+          <div class="brand-sub">Нарезка видео и автосубтитры в браузере</div>
+        </div>
+      </div>
+      <div class="stepper" id="stepper">
+        <span class="dot" data-step="upload"></span>
+        <span class="dot" data-step="settings"></span>
+        <span class="dot" data-step="processing"></span>
+        <span class="dot" data-step="results"></span>
+      </div>
+    </header>
+
+    <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
+    <section class="screen" id="screen-upload" data-screen="upload">
+      <div class="hero">
+        <h1>Нарезай видео на короткие клипы за минуту</h1>
+        <p>Загрузи ролик, выбери настройки — и получи стопку коротких вертикальных клипов с авто-субтитрами. Всё работает прямо в браузере, ничего не уходит на сервер.</p>
+      </div>
+
+      <label class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept="video/mp4,video/webm,video/quicktime,video/x-msvideo,video/*" />
+        <div class="dropzone-icon">↑</div>
+        <h3>Перетащите видео сюда</h3>
+        <p>или нажмите, чтобы выбрать файл</p>
+        <div class="formats">MP4 · MOV · WebM · AVI</div>
+      </label>
+
+      <div id="preview-block" class="preview-grid hidden">
+        <div class="panel preview-video">
+          <h3 class="panel-title">Предпросмотр</h3>
+          <video id="preview-video" controls preload="metadata"></video>
+        </div>
+        <div class="panel">
+          <h3 class="panel-title">Метаданные</h3>
+          <ul class="meta-list" id="meta-list"></ul>
+          <div class="btn-row">
+            <button class="btn btn-ghost" id="btn-reset-upload">Сменить файл</button>
+            <button class="btn btn-primary" id="btn-go-settings">Далее → Настройки</button>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================ ЭКРАН 2: НАСТРОЙКИ ================ -->
+    <section class="screen" id="screen-settings" data-screen="settings">
+
+      <div class="grid-2">
+        <!-- Левая колонка: основные параметры нарезки -->
+        <div class="panel">
+          <h3 class="panel-title">Длина клипа</h3>
+          <div class="pill-row" id="pill-length">
+            <div class="pill" data-v="15">15 <span class="sub">сек</span></div>
+            <div class="pill is-active" data-v="30">30 <span class="sub">сек</span></div>
+            <div class="pill" data-v="45">45 <span class="sub">сек</span></div>
+            <div class="pill" data-v="60">60 <span class="sub">сек</span></div>
+          </div>
+
+          <div class="sep"></div>
+
+          <h3 class="panel-title">Количество клипов</h3>
+          <div class="slider-row">
+            <input type="range" min="1" max="10" value="5" step="1" id="slider-count" />
+            <div class="slider-val mono" id="val-count">5</div>
+          </div>
+
+          <div class="sep"></div>
+
+          <h3 class="panel-title">Формат</h3>
+          <div class="aspect-toggle" id="aspect-toggle">
+            <div class="aspect-opt is-active" data-v="9:16">
+              <div class="aspect-icon v"></div>
+              <div>
+                <div style="font-weight:700;">9:16</div>
+                <div class="muted small">TikTok / Reels</div>
+              </div>
+            </div>
+            <div class="aspect-opt" data-v="16:9">
+              <div class="aspect-icon"></div>
+              <div>
+                <div style="font-weight:700;">16:9</div>
+                <div class="muted small">YouTube / оригинал</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="warn-banner" id="warn-banner"></div>
+        </div>
+
+        <!-- Правая колонка: стратегия + субтитры -->
+        <div class="panel">
+          <h3 class="panel-title">Стратегия</h3>
+
+          <div class="strategy-card is-active" data-v="uniform">
+            <div class="strategy-radio"></div>
+            <div>
+              <div class="strategy-title">Равномерно</div>
+              <div class="strategy-desc">Клипы распределены по всей длине видео.</div>
+            </div>
+          </div>
+          <div class="strategy-card" data-v="random">
+            <div class="strategy-radio"></div>
+            <div>
+              <div class="strategy-title">Случайные моменты</div>
+              <div class="strategy-desc">Псевдослучайные точки начала (с фиксированным seed).</div>
+            </div>
+          </div>
+          <div class="strategy-card" data-v="manual">
+            <div class="strategy-radio"></div>
+            <div>
+              <div class="strategy-title">Ручной выбор</div>
+              <div class="strategy-desc">Поставьте маркеры начала клипов на таймлайне.</div>
+            </div>
+          </div>
+
+          <div id="manual-timeline-wrap" class="hidden" style="margin-top:14px;">
+            <div class="muted small" style="margin-bottom:6px;">Кликайте по таймлайну, чтобы добавить маркер. Клик по «×» — удалить.</div>
+            <div class="timeline" id="timeline"></div>
+          </div>
+
+          <div class="sep"></div>
+
+          <h3 class="panel-title">Субтитры</h3>
+          <label class="toggle">
+            <input type="checkbox" id="cb-subs" />
+            <span class="switch"></span>
+            <span>Добавить субтитры автоматически (Whisper)</span>
+          </label>
+
+          <div class="subs-block" id="subs-block">
+            <div class="field-row">
+              <label class="k">Язык</label>
+              <div class="seg" id="subs-lang">
+                <button data-v="ru">Русский</button>
+                <button class="is-active" data-v="auto">Авто</button>
+                <button data-v="en">English</button>
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Модель</label>
+              <div class="seg" id="subs-model">
+                <button class="is-active" data-v="tiny">tiny · 75MB · быстро</button>
+                <button data-v="base">base · 150MB · точнее</button>
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Формат вывода</label>
+              <div class="seg" id="subs-output">
+                <button class="is-active" data-v="burn">Вжечь</button>
+                <button data-v="srt">.srt отдельно</button>
+                <button data-v="both">И то и то</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Панель оформления субтитров -->
+      <div class="panel subs-block" id="subs-style-panel" style="margin-top:20px;">
+        <div class="row-between" style="margin-bottom:14px;">
+          <h3 class="panel-title" style="margin:0;">Оформление субтитров</h3>
+          <div class="preset-row">
+            <button class="preset-btn" data-preset="tiktok">TikTok</button>
+            <button class="preset-btn" data-preset="youtube">YouTube</button>
+            <button class="preset-btn" data-preset="cinematic">Cinematic</button>
+            <button class="preset-btn" data-preset="bright">Яркий</button>
+            <button class="preset-btn" data-preset="minimal">Минимал</button>
+          </div>
+        </div>
+
+        <div class="style-grid">
+
+          <!-- Колонка 1: Шрифт + цвета -->
+          <div>
+            <h4 class="panel-title" style="font-size:12px;">Шрифт</h4>
+            <div class="field-row">
+              <label class="k">Семейство</label>
+              <select id="ss-family" class="input">
+                <option value="Arial">Arial</option>
+                <option value="Impact">Impact</option>
+                <option value="Montserrat">Montserrat</option>
+                <option value="Oswald">Oswald</option>
+                <option value="Bebas Neue">Bebas Neue</option>
+              </select>
+            </div>
+            <div class="field-row">
+              <label class="k">Размер</label>
+              <input type="range" id="ss-size" min="12" max="48" value="22" />
+              <div class="slider-val mono" id="ss-size-val">22</div>
+            </div>
+            <div class="field-row">
+              <label class="k">Стиль</label>
+              <label class="toggle"><input type="checkbox" id="ss-bold" checked /><span class="switch"></span><span>Жирный</span></label>
+              <label class="toggle"><input type="checkbox" id="ss-italic" /><span class="switch"></span><span>Курсив</span></label>
+            </div>
+
+            <div class="sep"></div>
+
+            <h4 class="panel-title" style="font-size:12px;">Цвет</h4>
+            <div class="field-row">
+              <label class="k">Цвет текста</label>
+              <div class="color-pair">
+                <input type="color" id="ss-color" value="#ffffff" />
+                <input type="text" class="input" id="ss-color-hex" value="#ffffff" />
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Цвет обводки</label>
+              <div class="color-pair">
+                <input type="color" id="ss-outline" value="#000000" />
+                <input type="text" class="input" id="ss-outline-hex" value="#000000" />
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Толщина обводки</label>
+              <input type="range" id="ss-outline-w" min="0" max="5" value="2" step="0.5" />
+              <div class="slider-val mono" id="ss-outline-w-val">2</div>
+            </div>
+          </div>
+
+          <!-- Колонка 2: Фон + позиция + анимация -->
+          <div>
+            <h4 class="panel-title" style="font-size:12px;">Фон субтитров</h4>
+            <div class="field-row">
+              <label class="k">Тип</label>
+              <div class="seg" id="ss-bg-type">
+                <button data-v="none">Без фона</button>
+                <button class="is-active" data-v="bar">Полоса</button>
+                <button data-v="rounded">Скруглённый</button>
+                <button data-v="shadow">Тень</button>
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Цвет фона</label>
+              <div class="color-pair">
+                <input type="color" id="ss-bg-color" value="#000000" />
+                <input type="range" id="ss-bg-alpha" min="0" max="100" value="60" />
+                <div class="slider-val mono" id="ss-bg-alpha-val">60</div>
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Отступы (padding)</label>
+              <input type="range" id="ss-pad" min="4" max="20" value="10" />
+              <div class="slider-val mono" id="ss-pad-val">10</div>
+            </div>
+
+            <div class="sep"></div>
+
+            <h4 class="panel-title" style="font-size:12px;">Позиция</h4>
+            <div class="field-row">
+              <label class="k">Вертикаль</label>
+              <div class="seg" id="ss-pos-v">
+                <button data-v="top">Сверху</button>
+                <button data-v="middle">По центру</button>
+                <button class="is-active" data-v="bottom">Снизу</button>
+              </div>
+            </div>
+            <div class="field-row">
+              <label class="k">Отступ от края</label>
+              <input type="range" id="ss-margin" min="2" max="20" value="8" />
+              <div class="slider-val mono" id="ss-margin-val">8%</div>
+            </div>
+            <div class="field-row">
+              <label class="k">Горизонталь</label>
+              <div class="seg" id="ss-pos-h">
+                <button data-v="left">Слева</button>
+                <button class="is-active" data-v="center">По центру</button>
+                <button data-v="right">Справа</button>
+              </div>
+            </div>
+
+            <div class="sep"></div>
+
+            <h4 class="panel-title" style="font-size:12px;">Анимация появления</h4>
+            <div class="field-row">
+              <label class="k">Тип</label>
+              <div class="seg" id="ss-anim">
+                <button class="is-active" data-v="none">Нет</button>
+                <button data-v="fade">Fade</button>
+                <button data-v="slide">Снизу вверх</button>
+                <button data-v="type">Печатная машинка</button>
+              </div>
+            </div>
+            <div class="muted small">Анимация работает в режиме «вжигания» как лёгкий fade-эффект; для отдельного .srt-файла стиль анимации не записывается.</div>
+          </div>
+        </div>
+
+        <div class="sep"></div>
+        <h4 class="panel-title" style="font-size:12px;">Живое превью</h4>
+        <div class="preview-stage" id="preview-stage">
+          <div class="muted small" style="position:absolute;top:10px;right:10px;">Образец</div>
+          <div class="preview-sub" id="preview-sub">Образец субтитра</div>
+        </div>
+      </div>
+
+      <div class="btn-row right">
+        <button class="btn btn-ghost" id="btn-back-upload">← Назад</button>
+        <button class="btn btn-primary" id="btn-start">Начать нарезку</button>
+      </div>
+    </section>
+
+    <!-- ================ ЭКРАН 3: ОБРАБОТКА ================ -->
+    <section class="screen" id="screen-processing" data-screen="processing">
+      <div class="panel progress-card">
+        <h2 style="margin:0 0 4px;">Обработка</h2>
+        <p class="muted small" id="proc-summary">Готовим всё необходимое…</p>
+
+        <div class="progress-bar total-bar"><div id="total-progress"></div></div>
+
+        <div style="margin-top:18px;">
+          <div class="phase" id="phase-ffmpeg">
+            <div class="phase-num">1</div>
+            <div class="phase-name"><div>Загрузка ядра FFmpeg</div><div class="meta" id="meta-ffmpeg">…</div></div>
+            <div class="phase-pct mono" id="pct-ffmpeg">0%</div>
+          </div>
+          <div class="phase" id="phase-whisper">
+            <div class="phase-num">2</div>
+            <div class="phase-name"><div>Загрузка модели Whisper</div><div class="meta" id="meta-whisper">…</div></div>
+            <div class="phase-pct mono" id="pct-whisper">0%</div>
+          </div>
+          <div class="phase" id="phase-clip">
+            <div class="phase-num">3</div>
+            <div class="phase-name"><div>Нарезка</div><div class="meta" id="meta-clip">…</div></div>
+            <div class="phase-pct mono" id="pct-clip">0%</div>
+          </div>
+          <div class="phase" id="phase-sub">
+            <div class="phase-num">4</div>
+            <div class="phase-name"><div>Распознавание речи и вжигание субтитров</div><div class="meta" id="meta-sub">…</div></div>
+            <div class="phase-pct mono" id="pct-sub">0%</div>
+          </div>
+        </div>
+
+        <div class="btn-row right">
+          <button class="btn btn-danger" id="btn-cancel">Отменить</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================ ЭКРАН 4: РЕЗУЛЬТАТЫ ================ -->
+    <section class="screen" id="screen-results" data-screen="results">
+      <div class="results-toolbar">
+        <h2 style="margin:0;">Готовые клипы</h2>
+        <div class="btn-row" style="margin:0;">
+          <button class="btn" id="btn-toggle-all-on" title="Включить субтитры на всех клипах">🔤 Все ON</button>
+          <button class="btn" id="btn-toggle-all-off" title="Выключить субтитры на всех клипах">🔇 Все OFF</button>
+          <button class="btn" id="btn-download-all">⬇ Скачать все</button>
+          <button class="btn btn-primary" id="btn-restart">Начать заново</button>
+        </div>
+      </div>
+      <div class="gallery" id="gallery"></div>
+    </section>
+  </div>
+
+  <!-- Тосты -->
+  <div class="toast-stack" id="toasts"></div>
+
+  <!-- Модалка редактора SRT -->
+  <div class="modal-bg" id="modal-edit">
+    <div class="modal">
+      <div class="modal-head">
+        <div>
+          <h3 style="margin:0;">Редактирование субтитров</h3>
+          <div class="muted small" id="edit-clip-name">Клип</div>
+        </div>
+        <button class="btn btn-ghost" id="btn-edit-close">✕</button>
+      </div>
+      <div class="modal-body" id="srt-editor"></div>
+      <div class="modal-foot">
+        <div class="muted small" id="edit-status"></div>
+        <button class="btn btn-ghost" id="btn-edit-cancel">Отмена</button>
+        <button class="btn btn-primary" id="btn-edit-apply">Применить</button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    'use strict';
+
+    // ====================================================================
+    // Подгружаем Transformers.js на window для удобного доступа
+    // ====================================================================
+    let _transformers = null;
+    async function loadTransformers() {
+      if (_transformers) return _transformers;
+      _transformers = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js');
+      // Запретим попытки загрузки с локальной файловой системы
+      _transformers.env.allowLocalModels = false;
+      return _transformers;
+    }
+
+    // ====================================================================
+    // EventBus — простой pub/sub
+    // ====================================================================
+    const EventBus = (() => {
+      const map = new Map();
+      return {
+        on(ev, fn) {
+          if (!map.has(ev)) map.set(ev, new Set());
+          map.get(ev).add(fn);
+          return () => map.get(ev)?.delete(fn);
+        },
+        off(ev, fn) { map.get(ev)?.delete(fn); },
+        emit(ev, payload) { map.get(ev)?.forEach((fn) => { try { fn(payload); } catch (e) { console.error(e); } }); },
+      };
+    })();
+
+    // ====================================================================
+    // AppState — централизованное хранилище
+    // ====================================================================
+    const AppState = {
+      // Видео
+      inputFile: null,
+      inputUrl: null,
+      inputMeta: null,        // { duration, width, height, size, fps? }
+
+      // Настройки нарезки
+      settings: {
+        clipLength: 30,
+        clipsCount: 5,
+        aspect: '9:16',
+        strategy: 'uniform',   // uniform | random | manual
+        manualMarkers: [],     // массив секунд
+        // субтитры
+        subsEnabled: false,
+        subsLang: 'auto',      // ru | en | auto
+        subsModel: 'tiny',     // tiny | base
+        subsOutput: 'burn',    // burn | srt | both
+        subsStyle: defaultStyle(),
+      },
+
+      // Статусы движков
+      ffmpegReady: false,
+      ffmpegFromCache: false,
+      whisperReady: false,
+      whisperFromCache: false,
+
+      // Управление
+      cancelRequested: false,
+      processing: false,
+
+      // Результаты
+      clips: [],     // см. ниже структуру
+      blobUrls: new Set(),
+    };
+
+    function defaultStyle() {
+      return {
+        family: 'Arial',
+        size: 22,
+        bold: true,
+        italic: false,
+        color: '#ffffff',
+        outline: '#000000',
+        outlineW: 2,
+        bgType: 'bar',         // none | bar | rounded | shadow
+        bgColor: '#000000',
+        bgAlpha: 60,
+        padding: 10,
+        posV: 'bottom',        // top | middle | bottom
+        margin: 8,
+        posH: 'center',        // left | center | right
+        anim: 'none',          // none | fade | slide | type
+      };
+    }
+
+    // ====================================================================
+    // IndexedDB-кеш для бинарников FFmpeg core
+    // ====================================================================
+    const IDBCache = (() => {
+      const DB_NAME = 'vertcut-cache';
+      const DB_VER = 1;
+      const STORE = 'ffmpeg';
+
+      function open() {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open(DB_NAME, DB_VER);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      }
+      async function get(key) {
+        const db = await open();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readonly');
+          const r = tx.objectStore(STORE).get(key);
+          r.onsuccess = () => resolve(r.result || null);
+          r.onerror = () => reject(r.error);
+        });
+      }
+      async function put(key, value) {
+        const db = await open();
+        return new Promise((resolve, reject) => {
+          const tx = db.transaction(STORE, 'readwrite');
+          tx.objectStore(STORE).put(value, key);
+          tx.oncomplete = () => resolve();
+          tx.onerror = () => reject(tx.error);
+        });
+      }
+      return { get, put };
+    })();
+
+    // ====================================================================
+    // FFmpegCore — FFmpeg.wasm с IndexedDB-кешем
+    //
+    // Архитектурная заметка:
+    // FFmpeg.wasm v0.11.6 запускается из главного потока, но ВСЁ тяжёлое
+    // (и сам декодер, и кодек) выполняется в его внутреннем Web Worker'е,
+    // создаваемом библиотекой автоматически — поэтому UI не фризит даже
+    // если мы вызываем createFFmpeg() с главной страницы. Дополнительно
+    // обернуть всю обёртку в свой Worker нельзя: ffmpeg.min.js v0.11.6
+    // обращается к `document` при загрузке.
+    //
+    // Под COEP=require-corp требуется, чтобы все ресурсы либо приходили
+    // с CORP-заголовком, либо были same-origin. Поэтому мы:
+    //   1. Скачиваем все файлы FFmpeg в главном потоке (CORP cross-origin
+    //      на CDN отрабатывает корректно для основного потока).
+    //   2. Кладём бинарники в IndexedDB.
+    //   3. На повторных запусках берём из IDB и отдаём как blob: URL —
+    //      эти URL same-origin, COEP пропускает их свободно.
+    // ====================================================================
+    const FFmpegCore = (() => {
+      const CORE_VERSION   = '0.11.0';
+      const FFMPEG_VERSION = '0.11.6';
+      const FFMPEG_LIB_URL = `https://unpkg.com/@ffmpeg/ffmpeg@${FFMPEG_VERSION}/dist/ffmpeg.min.js`;
+      const CORE_BASE      = `https://unpkg.com/@ffmpeg/core@${CORE_VERSION}/dist/`;
+      // Имена файлов = ключи в IndexedDB.
+      const CORE_FILES = ['ffmpeg-core.js', 'ffmpeg-core.wasm', 'ffmpeg-core.worker.js'];
+      const FFMPEG_KEY = 'ffmpeg.min.js';
+      // Шрифт для subtitles-фильтра: ffmpeg-core 0.11 не содержит шрифтов,
+      // libass без них рендерит пустой кадр. Подкладываем Roboto (~34KB)
+      // в виртуальную FS и указываем fontsdir в фильтре.
+      const FONT_KEY = 'fallback-font.ttf';
+      const FONT_URL = 'https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-400-normal.ttf';
+      // Имя файла шрифта внутри FFmpeg FS — обязательно с расширением .ttf,
+      // libass распознаёт font family по содержимому файла, а не по имени.
+      const FONT_FS_NAME = 'Roboto-Regular.ttf';
+
+      let ffmpeg = null;
+      let progressFraction = 0;
+      let fontBlobCache = null;
+
+      // Качаем все нужные файлы (FFmpeg-обёртку + 3 core-файла), кешируем в IDB.
+      async function fetchAllWithCache(onProgress) {
+        const allFiles = [
+          { key: FFMPEG_KEY, url: FFMPEG_LIB_URL },
+          ...CORE_FILES.map((f) => ({ key: f, url: CORE_BASE + f })),
+        ];
+        const out = {};
+        const cached = await Promise.all(allFiles.map((f) => IDBCache.get(f.key)));
+        const allCached = cached.every(Boolean);
+
+        if (allCached) {
+          allFiles.forEach((f, i) => { out[f.key] = cached[i]; });
+          if (onProgress) onProgress(1);
+          return { blobs: out, fromCache: true };
+        }
+
+        // Знаем нескачанные → считаем общий ожидаемый размер заранее (HEAD)
+        const sizes = await Promise.all(allFiles.map(async (f, i) => {
+          if (cached[i]) return 0;
+          try {
+            const r = await fetch(f.url, { method: 'HEAD' });
+            return +r.headers.get('content-length') || 0;
+          } catch (_) { return 0; }
+        }));
+        const knownTotal = sizes.reduce((a, b) => a + b, 0);
+        const total = knownTotal || 35_000_000; // ориентир на ~35MB всего
+        let loaded = 0;
+
+        for (let i = 0; i < allFiles.length; i++) {
+          const { key, url } = allFiles[i];
+          if (cached[i]) { out[key] = cached[i]; continue; }
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`HTTP ${res.status} для ${url}`);
+          const reader = res.body.getReader();
+          const chunks = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            chunks.push(value);
+            loaded += value.byteLength;
+            if (onProgress) onProgress(Math.min(0.99, loaded / total));
+          }
+          const blob = new Blob(chunks);
+          await IDBCache.put(key, blob);
+          out[key] = blob;
+        }
+        if (onProgress) onProgress(1);
+        return { blobs: out, fromCache: false };
+      }
+
+      // Загружаем ffmpeg.min.js в текущий документ через blob: URL.
+      // После загрузки на window появляется глобал FFmpeg ({ createFFmpeg, fetchFile }).
+      function loadLibScript(libBlob) {
+        return new Promise((resolve, reject) => {
+          if (window.FFmpeg && typeof window.FFmpeg.createFFmpeg === 'function') {
+            return resolve();
+          }
+          const url = URL.createObjectURL(libBlob);
+          const script = document.createElement('script');
+          script.src = url;
+          script.onload = () => resolve();
+          script.onerror = (e) => reject(new Error('Не удалось подгрузить ffmpeg.min.js'));
+          document.head.appendChild(script);
+        });
+      }
+
+      async function init(onProgress) {
+        if (AppState.ffmpegReady) return;
+
+        // 1) Качаем (или достаём из кеша) всё нужное.
+        const { blobs, fromCache } = await fetchAllWithCache(onProgress);
+        AppState.ffmpegFromCache = fromCache;
+
+        // 2) Подключаем библиотеку в текущую страницу.
+        await loadLibScript(blobs[FFMPEG_KEY]);
+
+        // 3) Создаём blob: URL для core/wasm/worker — оба же same-origin,
+        //    под COEP проходят без CORP-проверки.
+        const corePath   = URL.createObjectURL(blobs['ffmpeg-core.js']);
+        const wasmPath   = URL.createObjectURL(blobs['ffmpeg-core.wasm']);
+        const workerPath = URL.createObjectURL(blobs['ffmpeg-core.worker.js']);
+
+        // 4) Инстанциируем FFmpeg (внутри он уже создаст свой воркер).
+        const { createFFmpeg } = window.FFmpeg;
+        ffmpeg = createFFmpeg({
+          log: false,
+          corePath, wasmPath, workerPath,
+          progress: (p) => {
+            if (typeof p.ratio === 'number') progressFraction = p.ratio;
+            EventBus.emit('ffmpeg:progress', p);
+          },
+        });
+        await ffmpeg.load();
+        AppState.ffmpegReady = true;
+        EventBus.emit('ffmpeg:ready');
+      }
+
+      // Подсунуть шрифт в FS, если ещё не. Тянем 1 раз (или из IDB),
+      // потом при каждой инициализации FFmpeg просто writeFile в новую
+      // эмскриптеновскую FS — она пустая после очередного load().
+      async function ensureFontInFS() {
+        if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
+        // Проверяем наличие файла в FS — после ffmpeg.run() emscripten может
+        // не сохранять рабочую директорию между запусками, поэтому никогда
+        // не доверяем флагу: каждый раз пробуем стат, и при отсутствии —
+        // пишем заново. Кеш fontBlob держим в JS, чтобы не качать повторно.
+        try {
+          ffmpeg.FS('stat', `/fonts/${FONT_FS_NAME}`);
+          return;
+        } catch (_) {}
+        let blob = fontBlobCache;
+        if (!blob) {
+          blob = await IDBCache.get(FONT_KEY);
+        }
+        if (!blob) {
+          const r = await fetch(FONT_URL);
+          if (!r.ok) throw new Error(`Шрифт не скачался: HTTP ${r.status}`);
+          blob = await r.blob();
+          try { await IDBCache.put(FONT_KEY, blob); } catch (_) {}
+        }
+        fontBlobCache = blob;
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        try { ffmpeg.FS('mkdir', '/fonts'); } catch (_) {}
+        ffmpeg.FS('writeFile', `/fonts/${FONT_FS_NAME}`, buf);
+      }
+
+      // Прямые операции без RPC — FFmpeg.wasm и так делегирует тяжёлое
+      // в свой собственный Worker, мы здесь только дирижёр.
+      async function run(args) {
+        if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
+        await ffmpeg.run(...args);
+      }
+      async function writeFile(name, data) {
+        if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
+        ffmpeg.FS('writeFile', name, data);
+      }
+      async function readFile(name) {
+        if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
+        // Копируем из эмскриптеновского heap'а (это может быть SharedArrayBuffer
+        // из-за pthread): `new Uint8Array(view)` отдаёт уже обычный ArrayBuffer,
+        // совместимый с Blob() и postMessage без особых правил.
+        return new Uint8Array(ffmpeg.FS('readFile', name));
+      }
+      async function unlink(name) {
+        if (!ffmpeg) return;
+        try { ffmpeg.FS('unlink', name); } catch (_) {}
+      }
+      async function exit() {
+        if (!ffmpeg) return;
+        try { ffmpeg.exit(); } catch (_) {}
+        ffmpeg = null;
+        AppState.ffmpegReady = false;
+      }
+
+      return {
+        init, run, writeFile, readFile, unlink, exit,
+        ensureFontInFS,
+        getProgressFraction: () => progressFraction,
+      };
+    })();
+
+    // ====================================================================
+    // WhisperCore — Transformers.js automatic-speech-recognition
+    // ====================================================================
+    const WhisperCore = (() => {
+      let pipe = null;
+      let currentModel = null;
+
+      async function load(modelSize, onProgress) {
+        const { pipeline } = await loadTransformers();
+        if (pipe && currentModel === modelSize) return pipe;
+        const modelName = modelSize === 'base' ? 'Xenova/whisper-base' : 'Xenova/whisper-tiny';
+        let lastSeen = 0;
+        let cacheHit = true;
+        pipe = await pipeline('automatic-speech-recognition', modelName, {
+          progress_callback: (data) => {
+            // data: { status, name, file, progress, loaded, total }
+            if (data.status === 'download' || data.status === 'progress') cacheHit = false;
+            if (typeof data.progress === 'number') {
+              lastSeen = Math.max(lastSeen, data.progress / 100);
+              onProgress && onProgress(lastSeen, data);
+            } else if (data.status === 'ready' || data.status === 'done') {
+              onProgress && onProgress(1, data);
+            }
+          },
+        });
+        currentModel = modelSize;
+        AppState.whisperReady = true;
+        AppState.whisperFromCache = cacheHit;
+        return pipe;
+      }
+
+      async function transcribe(audioFloat32, lang) {
+        if (!pipe) throw new Error('Whisper не инициализирован');
+        const opts = { return_timestamps: true, chunk_length_s: 30 };
+        if (lang === 'ru') opts.language = 'russian';
+        else if (lang === 'en') opts.language = 'english';
+        const result = await pipe(audioFloat32, opts);
+        return result; // { text, chunks: [{text, timestamp:[s,e]}] }
+      }
+
+      function isReady() { return !!pipe; }
+      function reset() { pipe = null; currentModel = null; AppState.whisperReady = false; }
+
+      return { load, transcribe, isReady, reset };
+    })();
+
+    // ====================================================================
+    // SubtitleManager — SRT, ASS-стиль для FFmpeg, превью, пресеты
+    // ====================================================================
+    const SubtitleManager = (() => {
+
+      const PRESETS = {
+        tiktok: {
+          family: 'Impact', size: 28, bold: true, italic: false,
+          color: '#ffffff', outline: '#000000', outlineW: 3,
+          bgType: 'none', bgColor: '#000000', bgAlpha: 0, padding: 8,
+          posV: 'bottom', margin: 12, posH: 'center', anim: 'none',
+        },
+        youtube: {
+          family: 'Arial', size: 22, bold: false, italic: false,
+          color: '#ffffff', outline: '#000000', outlineW: 1,
+          bgType: 'bar', bgColor: '#000000', bgAlpha: 70, padding: 10,
+          posV: 'bottom', margin: 6, posH: 'center', anim: 'none',
+        },
+        cinematic: {
+          family: 'Montserrat', size: 20, bold: false, italic: false,
+          color: '#ffffff', outline: '#000000', outlineW: 0,
+          bgType: 'none', bgColor: '#000000', bgAlpha: 0, padding: 4,
+          posV: 'bottom', margin: 10, posH: 'center', anim: 'fade',
+        },
+        bright: {
+          family: 'Bebas Neue', size: 32, bold: true, italic: false,
+          color: '#ffe000', outline: '#000000', outlineW: 3,
+          bgType: 'none', bgColor: '#000000', bgAlpha: 0, padding: 4,
+          posV: 'middle', margin: 0, posH: 'center', anim: 'none',
+        },
+        minimal: {
+          family: 'Arial', size: 14, bold: false, italic: false,
+          color: '#ffffff', outline: '#000000', outlineW: 0,
+          bgType: 'none', bgColor: '#000000', bgAlpha: 0, padding: 2,
+          posV: 'top', margin: 4, posH: 'center', anim: 'none',
+        },
+      };
+
+      function pad(n, w) { return String(n).padStart(w, '0'); }
+
+      function formatSRTTime(sec) {
+        if (!isFinite(sec) || sec < 0) sec = 0;
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = Math.floor(sec % 60);
+        const ms = Math.floor((sec - Math.floor(sec)) * 1000);
+        return `${pad(h,2)}:${pad(m,2)}:${pad(s,2)},${pad(ms,3)}`;
+      }
+
+      function chunksToSRT(chunks, offset = 0) {
+        // chunks: [{text, timestamp:[s,e]}]
+        let s = '';
+        let idx = 1;
+        for (const c of chunks) {
+          if (!c || !c.timestamp) continue;
+          let [a, b] = c.timestamp;
+          if (a == null || b == null) continue;
+          a = Math.max(0, a - offset);
+          b = Math.max(a + 0.1, b - offset);
+          const text = (c.text || '').trim();
+          if (!text) continue;
+          s += `${idx}\n${formatSRTTime(a)} --> ${formatSRTTime(b)}\n${text}\n\n`;
+          idx++;
+        }
+        return s;
+      }
+
+      // Парсер SRT в массив сегментов: [{idx, start, end, text}]
+      function parseSRT(text) {
+        const out = [];
+        const blocks = text.replace(/\r/g, '').split(/\n\s*\n/);
+        for (const b of blocks) {
+          const lines = b.trim().split('\n');
+          if (lines.length < 2) continue;
+          const idx = parseInt(lines[0], 10);
+          const m = lines[1].match(/(\d+):(\d+):(\d+)[,\.](\d+)\s*-->\s*(\d+):(\d+):(\d+)[,\.](\d+)/);
+          if (!m) continue;
+          const start = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (+m[4]) / 1000;
+          const end   = (+m[5]) * 3600 + (+m[6]) * 60 + (+m[7]) + (+m[8]) / 1000;
+          const txt = lines.slice(2).join('\n');
+          out.push({ idx: out.length + 1, start, end, text: txt });
+        }
+        return out;
+      }
+
+      // Экспорт сегментов обратно в SRT
+      function segmentsToSRT(segments) {
+        let s = '';
+        segments.forEach((c, i) => {
+          s += `${i + 1}\n${formatSRTTime(c.start)} --> ${formatSRTTime(c.end)}\n${c.text.trim()}\n\n`;
+        });
+        return s;
+      }
+
+      // ASS-цвет: формат &HAABBGGRR. В ASS альфа-байт — это transparency
+      // (00 = непрозрачный, FF = полностью прозрачный), поэтому из percent
+      // opacity (0..100, где 100 = полностью видимо) мы инвертируем.
+      function hexToASS(hex, opacityPercent = 100) {
+        const h = hex.replace('#', '');
+        const r = h.substring(0, 2), g = h.substring(2, 4), b = h.substring(4, 6);
+        const op = Math.max(0, Math.min(100, opacityPercent));
+        const a = Math.round((100 - op) * 255 / 100);
+        const ah = a.toString(16).padStart(2, '0').toUpperCase();
+        return `&H${ah}${b.toUpperCase()}${g.toUpperCase()}${r.toUpperCase()}`;
+      }
+
+      // Собираем строку force_style для ffmpeg subtitles=...
+      // FFmpeg.wasm 0.11 (FFmpeg 4.4) собран без fontconfig, поэтому libass
+      // умеет находить шрифты только по точному совпадению Family из TTF в
+      // fontsdir. Мы кладём в /fonts один шрифт Roboto и ВСЕГДА указываем
+      // FontName=Roboto в force_style — иначе libass не находит запрошенный
+      // фонт и рендерит пустой кадр без ошибки. На превью оставляем оригинал.
+      function buildForceStyle(style) {
+        const map = {
+          'top-left': 7, 'top-center': 8, 'top-right': 9,
+          'middle-left': 4, 'middle-center': 5, 'middle-right': 6,
+          'bottom-left': 1, 'bottom-center': 2, 'bottom-right': 3,
+        };
+        const alignment = map[`${style.posV}-${style.posH}`] || 2;
+        const primary = hexToASS(style.color, 100);
+        const outline = hexToASS(style.outline, 100);
+        const back = hexToASS(style.bgColor, style.bgAlpha);
+        const borderStyle = style.bgType === 'bar' || style.bgType === 'rounded' ? 3 : 1;
+        const outlineThickness = style.outlineW || 0;
+        const shadow = style.bgType === 'shadow' ? 2 : 0;
+        // libass без явного [Script Info] использует PlayResY=288 для скейла,
+        // поэтому MarginV считаем в этой системе координат, а не в пикселях
+        // итогового видео — иначе субтитры уезжают к центру кадра.
+        const marginV = Math.round((style.margin / 100) * 288);
+        const parts = [
+          `FontName=Roboto`,
+          `FontSize=${style.size}`,
+          `Bold=${style.bold ? -1 : 0}`,
+          `Italic=${style.italic ? -1 : 0}`,
+          `PrimaryColour=${primary}`,
+          `OutlineColour=${outline}`,
+          `BackColour=${back}`,
+          `BorderStyle=${borderStyle}`,
+          `Outline=${outlineThickness}`,
+          `Shadow=${shadow}`,
+          `Alignment=${alignment}`,
+          `MarginV=${marginV}`,
+        ];
+        return parts.join(',');
+      }
+
+      // CSS для превью
+      function buildPreviewCSS(style) {
+        const css = {};
+        css.fontFamily = style.family;
+        css.fontSize = style.size + 'px';
+        css.fontWeight = style.bold ? '700' : '400';
+        css.fontStyle = style.italic ? 'italic' : 'normal';
+        css.color = style.color;
+        css.padding = style.padding + 'px';
+        css.textAlign = style.posH;
+        // Обводка — text-shadow в 4 направлениях
+        const w = style.outlineW;
+        if (w > 0) {
+          const c = style.outline;
+          css.textShadow = `${-w}px 0 ${c}, ${w}px 0 ${c}, 0 ${-w}px ${c}, 0 ${w}px ${c}, ${w}px ${w}px ${c}, ${-w}px ${-w}px ${c}, ${w}px ${-w}px ${c}, ${-w}px ${w}px ${c}`;
+        } else {
+          css.textShadow = 'none';
+        }
+        // Фон
+        const bgRGBA = (() => {
+          const h = style.bgColor.replace('#', '');
+          const r = parseInt(h.substring(0, 2), 16);
+          const g = parseInt(h.substring(2, 4), 16);
+          const b = parseInt(h.substring(4, 6), 16);
+          return `rgba(${r}, ${g}, ${b}, ${style.bgAlpha / 100})`;
+        })();
+        if (style.bgType === 'bar') {
+          css.background = bgRGBA;
+          css.borderRadius = '0';
+          css.boxShadow = 'none';
+        } else if (style.bgType === 'rounded') {
+          css.background = bgRGBA;
+          css.borderRadius = '10px';
+          css.boxShadow = 'none';
+        } else if (style.bgType === 'shadow') {
+          css.background = 'transparent';
+          css.boxShadow = `0 4px 18px ${bgRGBA}`;
+        } else {
+          css.background = 'transparent';
+          css.boxShadow = 'none';
+        }
+        // Позиция
+        css.bottom = ''; css.top = ''; css.transform = '';
+        if (style.posV === 'bottom') css.bottom = style.margin + '%';
+        else if (style.posV === 'top') css.top = style.margin + '%';
+        else { css.top = '50%'; css.transform = 'translate(-50%, -50%)'; }
+        // Горизонталь
+        if (style.posH === 'left')  { css.left = style.margin + '%'; css.right = 'auto'; }
+        else if (style.posH === 'right') { css.right = style.margin + '%'; css.left = 'auto'; }
+        else { css.left = '50%'; css.right = 'auto'; if (!css.transform) css.transform = 'translateX(-50%)'; else css.transform = 'translate(-50%, -50%)'; }
+        return css;
+      }
+
+      return { PRESETS, chunksToSRT, parseSRT, segmentsToSRT, formatSRTTime, buildForceStyle, buildPreviewCSS };
+    })();
+
+    // ====================================================================
+    // VideoProcessor — вся логика нарезки/субтитров на FFmpeg
+    // ====================================================================
+    const VideoProcessor = (() => {
+
+      // Простой seedable PRNG (mulberry32)
+      function mulberry32(seed) {
+        return function () {
+          let t = (seed += 0x6D2B79F5);
+          t = Math.imul(t ^ (t >>> 15), t | 1);
+          t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+          return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+        };
+      }
+
+      function calcPlan(strategy, clipLength, clipsCount, duration, manualMarkers) {
+        const plan = [];
+        const safeDur = Math.max(0, duration - 0.05);
+        if (strategy === 'manual') {
+          for (const start of manualMarkers) {
+            const s = Math.max(0, Math.min(start, safeDur - 0.5));
+            const e = Math.min(safeDur, s + clipLength);
+            plan.push({ start: s, end: e });
+          }
+        } else if (strategy === 'random') {
+          const rng = mulberry32(20240501);
+          const max = Math.max(0, safeDur - clipLength);
+          for (let i = 0; i < clipsCount; i++) {
+            const s = max > 0 ? rng() * max : 0;
+            plan.push({ start: s, end: Math.min(safeDur, s + clipLength) });
+          }
+          plan.sort((a, b) => a.start - b.start);
+        } else {
+          const max = Math.max(0, safeDur - clipLength);
+          if (clipsCount === 1) {
+            const s = max / 2;
+            plan.push({ start: s, end: Math.min(safeDur, s + clipLength) });
+          } else {
+            const step = max / (clipsCount - 1);
+            for (let i = 0; i < clipsCount; i++) {
+              const s = i * step;
+              plan.push({ start: s, end: Math.min(safeDur, s + clipLength) });
+            }
+          }
+        }
+        // Ограничим перекрытия и невалидные диапазоны
+        return plan.filter((p) => p.end - p.start > 0.5);
+      }
+
+      function fmtTime(sec) {
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = Math.floor(sec % 60);
+        return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      }
+
+      // WAV PCM-парсер: моно 16kHz 16bit -> Float32Array [-1..1]
+      function parseWavToFloat32(arrayBuffer) {
+        const view = new DataView(arrayBuffer);
+        // ищем chunk 'data'
+        let offset = 12;
+        let dataOffset = -1;
+        let dataSize = 0;
+        let bitsPerSample = 16;
+        let numChannels = 1;
+        let sampleRate = 16000;
+        while (offset < view.byteLength - 8) {
+          const id = String.fromCharCode(view.getUint8(offset), view.getUint8(offset + 1), view.getUint8(offset + 2), view.getUint8(offset + 3));
+          const size = view.getUint32(offset + 4, true);
+          if (id === 'fmt ') {
+            numChannels = view.getUint16(offset + 8 + 2, true);
+            sampleRate = view.getUint32(offset + 8 + 4, true);
+            bitsPerSample = view.getUint16(offset + 8 + 14, true);
+          } else if (id === 'data') {
+            dataOffset = offset + 8;
+            dataSize = size;
+            break;
+          }
+          offset += 8 + size;
+        }
+        if (dataOffset < 0) throw new Error('WAV: чанк data не найден');
+        const samples = dataSize / (bitsPerSample / 8) / numChannels;
+        const out = new Float32Array(samples);
+        if (bitsPerSample === 16) {
+          for (let i = 0; i < samples; i++) {
+            // моно — берём первый канал
+            const s = view.getInt16(dataOffset + i * 2 * numChannels, true);
+            out[i] = s / 32768;
+          }
+        } else if (bitsPerSample === 32) {
+          for (let i = 0; i < samples; i++) {
+            out[i] = view.getFloat32(dataOffset + i * 4 * numChannels, true);
+          }
+        } else {
+          throw new Error('WAV: неподдерживаемый bps ' + bitsPerSample);
+        }
+        return { audio: out, sampleRate };
+      }
+
+      // Линейный ресемплинг до 16kHz если вдруг другая частота
+      function resampleTo16k(audio, sr) {
+        if (sr === 16000) return audio;
+        const ratio = sr / 16000;
+        const len = Math.floor(audio.length / ratio);
+        const out = new Float32Array(len);
+        for (let i = 0; i < len; i++) {
+          const idx = i * ratio;
+          const i0 = Math.floor(idx);
+          const i1 = Math.min(audio.length - 1, i0 + 1);
+          const frac = idx - i0;
+          out[i] = audio[i0] * (1 - frac) + audio[i1] * frac;
+        }
+        return out;
+      }
+
+      // Главный пайплайн обработки
+      async function process(ctx) {
+        const { file, settings, plan, onPhase, onTotal } = ctx;
+        const totalSteps = plan.length;
+        const subsOn = settings.subsEnabled;
+
+        // 1. Запишем входной файл в FS
+        onPhase('clip', { i: 0, total: totalSteps, label: 'Загружаем видео в FFmpeg' });
+        const buf = new Uint8Array(await file.arrayBuffer());
+        const inputName = 'input.' + (file.name.split('.').pop() || 'mp4').toLowerCase();
+        await FFmpegCore.writeFile(inputName, buf);
+
+        const results = [];
+
+        for (let i = 0; i < plan.length; i++) {
+          if (AppState.cancelRequested) break;
+
+          const seg = plan[i];
+          const dur = seg.end - seg.start;
+          const clipName = `clip_${i + 1}.mp4`;
+
+          onPhase('clip', {
+            i: i + 1, total: totalSteps,
+            label: `Клип ${i + 1} из ${totalSteps} · ${fmtTime(seg.start)} → ${fmtTime(seg.end)}`,
+            sub: 0,
+          });
+
+          // ---------- Нарезка ----------
+          try {
+            const baseArgs = ['-ss', String(seg.start), '-i', inputName, '-t', String(dur)];
+            const args = settings.aspect === '9:16'
+              ? [
+                  ...baseArgs,
+                  '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
+                  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                  '-c:a', 'aac', '-b:a', '128k',
+                  '-movflags', '+faststart',
+                  clipName,
+                ]
+              : [
+                  ...baseArgs,
+                  '-c:v', 'copy', '-c:a', 'copy',
+                  '-movflags', '+faststart',
+                  clipName,
+                ];
+            try {
+              await FFmpegCore.run(args);
+            } catch (errCopy) {
+              // фоллбэк на перекодирование 16:9
+              if (settings.aspect === '16:9') {
+                await FFmpegCore.run([
+                  ...baseArgs,
+                  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                  '-c:a', 'aac', '-b:a', '128k',
+                  '-movflags', '+faststart',
+                  clipName,
+                ]);
+              } else {
+                throw errCopy;
+              }
+            }
+
+            const clipData = await FFmpegCore.readFile(clipName);
+            const clipBlob = new Blob([clipData.buffer], { type: 'video/mp4' });
+            const clipUrl = URL.createObjectURL(clipBlob);
+            AppState.blobUrls.add(clipUrl);
+
+            const clipResult = {
+              index: i + 1,
+              start: seg.start,
+              end: seg.end,
+              size: clipBlob.size,
+              originalUrl: clipUrl,
+              originalBlob: clipBlob,
+              withSubsUrl: null,
+              withSubsBlob: null,
+              segments: null,           // массив SRT-сегментов после Whisper
+              srtBlob: null,
+              srtUrl: null,
+              error: null,
+              noSpeech: false,
+              subsActive: subsOn,       // активен ли субтитровый вариант на карточке
+              clipName,
+            };
+
+            // ---------- Субтитры ----------
+            if (subsOn && !AppState.cancelRequested) {
+              try {
+                onPhase('sub', {
+                  i: i + 1, total: totalSteps,
+                  label: `Распознавание речи · клип ${i + 1}/${totalSteps}`,
+                  pct: 0,
+                });
+                const audioName = `audio_${i + 1}.wav`;
+                await FFmpegCore.run([
+                  '-i', clipName, '-vn', '-ar', '16000', '-ac', '1', '-f', 'wav', audioName,
+                ]);
+                const wavBytes = await FFmpegCore.readFile(audioName);
+                await FFmpegCore.unlink(audioName);
+                const { audio, sampleRate } = parseWavToFloat32(wavBytes.buffer);
+                const audio16 = resampleTo16k(audio, sampleRate);
+
+                onPhase('sub', {
+                  i: i + 1, total: totalSteps,
+                  label: `Whisper · клип ${i + 1}/${totalSteps}`,
+                  pct: 30,
+                });
+
+                const tr = await WhisperCore.transcribe(audio16, settings.subsLang);
+                const chunks = (tr && tr.chunks) ? tr.chunks : [];
+                const cleanChunks = chunks.filter((c) => c && c.text && c.text.trim().length > 0);
+                if (cleanChunks.length === 0) {
+                  clipResult.noSpeech = true;
+                  clipResult.subsActive = false;
+                } else {
+                  const srt = SubtitleManager.chunksToSRT(cleanChunks);
+                  clipResult.segments = SubtitleManager.parseSRT(srt);
+                  const srtBlob = new Blob([srt], { type: 'application/x-subrip' });
+                  clipResult.srtBlob = srtBlob;
+                  const srtUrl = URL.createObjectURL(srtBlob);
+                  AppState.blobUrls.add(srtUrl);
+                  clipResult.srtUrl = srtUrl;
+
+                  // Вжигание
+                  if (settings.subsOutput === 'burn' || settings.subsOutput === 'both') {
+                    onPhase('sub', {
+                      i: i + 1, total: totalSteps,
+                      label: `Вжигание субтитров · клип ${i + 1}/${totalSteps}`,
+                      pct: 70,
+                    });
+                    await FFmpegCore.ensureFontInFS();
+                    const subName = `sub_${i + 1}.srt`;
+                    await FFmpegCore.writeFile(subName, new TextEncoder().encode(srt));
+                    const finalName = `final_${i + 1}.mp4`;
+                    const force = SubtitleManager.buildForceStyle(settings.subsStyle);
+                    // Экранируем апостроф/двоеточие для filter
+                    const safeForce = force.replace(/'/g, "\\'");
+                    const vf = `subtitles=${subName}:fontsdir=/fonts:force_style='${safeForce}'`;
+                    await FFmpegCore.run([
+                      '-i', clipName,
+                      '-vf', vf,
+                      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                      '-c:a', 'copy',
+                      finalName,
+                    ]);
+                    const finalData = await FFmpegCore.readFile(finalName);
+                    const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
+                    const finalUrl = URL.createObjectURL(finalBlob);
+                    AppState.blobUrls.add(finalUrl);
+                    clipResult.withSubsBlob = finalBlob;
+                    clipResult.withSubsUrl = finalUrl;
+                    await FFmpegCore.unlink(subName);
+                    await FFmpegCore.unlink(finalName);
+                  }
+                  clipResult.subsActive = !!clipResult.withSubsUrl;
+                }
+                onPhase('sub', { i: i + 1, total: totalSteps, label: `Готово`, pct: 100 });
+              } catch (subErr) {
+                console.error('Subtitle pipeline error', subErr);
+                clipResult.subsError = subErr.message || String(subErr);
+                clipResult.subsActive = false;
+              }
+            }
+
+            // Очистка для исходного клипа из FS
+            await FFmpegCore.unlink(clipName);
+
+            results.push(clipResult);
+          } catch (clipErr) {
+            // Если это последствие отмены (мы убили ffmpeg) — не считаем это
+            // ошибкой, просто молча выходим из цикла.
+            if (AppState.cancelRequested) break;
+            console.error('Clip error', clipErr);
+            results.push({
+              index: i + 1,
+              start: seg.start,
+              end: seg.end,
+              error: clipErr.message || String(clipErr),
+            });
+          }
+
+          if (onTotal) onTotal((i + 1) / totalSteps);
+        }
+
+        // Финальная очистка входного файла
+        try { await FFmpegCore.unlink(inputName); } catch (_) {}
+
+        return results;
+      }
+
+      // Перерендер существующего клипа с новыми сегментами SRT (для редактора)
+      async function rerenderWithSubs(clip, segments, settings) {
+        const { originalBlob } = clip;
+        if (!originalBlob) throw new Error('Нет исходного клипа');
+        const inputName = `re_input_${clip.index}.mp4`;
+        const subName = `re_sub_${clip.index}.srt`;
+        const finalName = `re_final_${clip.index}.mp4`;
+        await FFmpegCore.writeFile(inputName, new Uint8Array(await originalBlob.arrayBuffer()));
+        const srt = SubtitleManager.segmentsToSRT(segments);
+        await FFmpegCore.writeFile(subName, new TextEncoder().encode(srt));
+        await FFmpegCore.ensureFontInFS();
+        const force = SubtitleManager.buildForceStyle(settings.subsStyle);
+        const safeForce = force.replace(/'/g, "\\'");
+        const vf = `subtitles=${subName}:fontsdir=/fonts:force_style='${safeForce}'`;
+        await FFmpegCore.run([
+          '-i', inputName, '-vf', vf,
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+          '-c:a', 'copy', finalName,
+        ]);
+        const finalData = await FFmpegCore.readFile(finalName);
+        const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
+        const finalUrl = URL.createObjectURL(finalBlob);
+        AppState.blobUrls.add(finalUrl);
+        // Чистим
+        await FFmpegCore.unlink(inputName);
+        await FFmpegCore.unlink(subName);
+        await FFmpegCore.unlink(finalName);
+        // Чистим старый with-subs URL
+        if (clip.withSubsUrl) {
+          URL.revokeObjectURL(clip.withSubsUrl);
+          AppState.blobUrls.delete(clip.withSubsUrl);
+        }
+        clip.withSubsBlob = finalBlob;
+        clip.withSubsUrl = finalUrl;
+        clip.segments = segments;
+        // Обновим SRT blob
+        if (clip.srtUrl) URL.revokeObjectURL(clip.srtUrl);
+        const newSrt = new Blob([srt], { type: 'application/x-subrip' });
+        clip.srtBlob = newSrt;
+        clip.srtUrl = URL.createObjectURL(newSrt);
+        AppState.blobUrls.add(clip.srtUrl);
+        clip.subsActive = true;
+        return clip;
+      }
+
+      return { calcPlan, process, rerenderWithSubs, fmtTime };
+    })();
+
+    // ====================================================================
+    // UIController — экраны, тосты, прогресс
+    // ====================================================================
+    const UI = (() => {
+      const screens = ['upload', 'settings', 'processing', 'results'];
+
+      function show(name) {
+        for (const sc of screens) {
+          const el = document.querySelector(`[data-screen="${sc}"]`);
+          if (!el) continue;
+          if (sc === name) {
+            el.classList.add('is-active');
+            // двойной requestAnimationFrame для надёжного срабатывания CSS-перехода
+            requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('is-visible')));
+          } else {
+            el.classList.remove('is-visible');
+            el.classList.remove('is-active');
+          }
+        }
+        // Степпер
+        const stepIdx = screens.indexOf(name);
+        document.querySelectorAll('#stepper .dot').forEach((d, i) => {
+          d.classList.toggle('active', i === stepIdx);
+          d.classList.toggle('done', i < stepIdx);
+        });
+      }
+
+      function toast(msg, type = 'ok', timeout = 4000) {
+        const el = document.createElement('div');
+        el.className = 'toast t-' + type;
+        el.textContent = msg;
+        document.getElementById('toasts').appendChild(el);
+        setTimeout(() => {
+          el.style.opacity = '0';
+          el.style.transform = 'translateX(40px)';
+          setTimeout(() => el.remove(), 300);
+        }, timeout);
+      }
+
+      function setPhaseProgress(phaseId, pct, meta) {
+        const phase = document.getElementById('phase-' + phaseId);
+        const pctEl = document.getElementById('pct-' + phaseId);
+        const metaEl = document.getElementById('meta-' + phaseId);
+        if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+        if (metaEl && meta != null) metaEl.textContent = meta;
+        if (phase) {
+          phase.classList.toggle('is-active', pct > 0 && pct < 100);
+          phase.classList.toggle('is-done', pct >= 100);
+        }
+      }
+
+      function setTotalProgress(frac) {
+        const el = document.getElementById('total-progress');
+        if (el) el.style.width = Math.round(frac * 100) + '%';
+      }
+
+      return { show, toast, setPhaseProgress, setTotalProgress };
+    })();
+
+    // ====================================================================
+    // GalleryManager — карточки и взаимодействие
+    // ====================================================================
+    const GalleryManager = (() => {
+
+      function fmt(sec) {
+        const h = Math.floor(sec / 3600);
+        const m = Math.floor((sec % 3600) / 60);
+        const s = Math.floor(sec % 60);
+        return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+      }
+
+      function fmtSize(bytes) {
+        if (bytes < 1024) return bytes + ' B';
+        if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+        return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+      }
+
+      function pickUrl(clip) {
+        // если активны субтитры и есть with-subs — отдадим с субами
+        if (clip.subsActive && clip.withSubsUrl) return clip.withSubsUrl;
+        return clip.originalUrl;
+      }
+
+      function render(clips) {
+        const root = document.getElementById('gallery');
+        root.innerHTML = '';
+        const isVertical = AppState.settings.aspect === '9:16';
+
+        clips.forEach((clip, i) => {
+          const card = document.createElement('div');
+          card.className = 'clip-card';
+          card.style.setProperty('--i', i);
+          card.dataset.index = clip.index;
+
+          if (clip.error) {
+            card.innerHTML = `
+              <div class="clip-body">
+                <div class="clip-error">Ошибка клипа ${clip.index}: ${clip.error}</div>
+                <div class="clip-meta"><span>${fmt(clip.start)} → ${fmt(clip.end)}</span></div>
+                <div class="clip-actions"><button class="btn" data-action="retry">Попробовать снова</button></div>
+              </div>
+            `;
+          } else {
+            const url = pickUrl(clip);
+            card.innerHTML = `
+              <div class="clip-video-wrap ${isVertical ? '' : 'h-mode'}">
+                ${clip.subsActive && clip.withSubsUrl ? '<div class="clip-tag">🔤 Субтитры</div>' : ''}
+                ${clip.noSpeech ? '<div class="clip-tag" style="background:rgba(245,197,74,0.2);color:#ffd97a;">Речь не обнаружена</div>' : ''}
+                <video src="${url}" controls loop muted playsinline></video>
+              </div>
+              <div class="clip-body">
+                <div class="clip-meta">
+                  <span class="mono">${fmt(clip.start)} → ${fmt(clip.end)}</span>
+                  <span class="mono">${fmtSize((clip.subsActive && clip.withSubsBlob) ? clip.withSubsBlob.size : clip.originalBlob.size)}</span>
+                </div>
+                <div class="clip-actions">
+                  ${clip.withSubsUrl ? `
+                    <button class="icon-btn ${clip.subsActive ? 'is-on' : ''}" data-action="toggle-subs" title="Субтитры на клипе ON/OFF">🔤</button>
+                  ` : ''}
+                  <button class="btn" data-action="download">⬇ Скачать клип</button>
+                  ${clip.srtUrl ? '<button class="btn" data-action="download-srt">⬇ .srt</button>' : ''}
+                  ${clip.segments ? '<button class="btn btn-ghost" data-action="edit">✏️ Редактировать</button>' : ''}
+                </div>
+                ${clip.subsError ? `<div class="clip-no-speech">Субтитры не сгенерированы: ${clip.subsError}</div>` : ''}
+              </div>
+            `;
+          }
+
+          // Обработчики
+          card.addEventListener('click', (ev) => {
+            const t = ev.target.closest('[data-action]');
+            if (!t) return;
+            const action = t.dataset.action;
+            if (action === 'download') downloadClip(clip);
+            else if (action === 'download-srt') downloadSRT(clip);
+            else if (action === 'edit') openEditor(clip);
+            else if (action === 'toggle-subs') toggleSubs(clip);
+            else if (action === 'retry') EventBus.emit('clip:retry', clip);
+          });
+
+          root.appendChild(card);
+        });
+      }
+
+      function downloadClip(clip) {
+        const url = pickUrl(clip);
+        const blob = (clip.subsActive && clip.withSubsBlob) ? clip.withSubsBlob : clip.originalBlob;
+        const ext = 'mp4';
+        const name = `clip_${String(clip.index).padStart(2, '0')}${clip.subsActive && clip.withSubsBlob ? '_subs' : ''}.${ext}`;
+        triggerDownload(url, name);
+      }
+      function downloadSRT(clip) {
+        if (!clip.srtUrl) return;
+        triggerDownload(clip.srtUrl, `clip_${String(clip.index).padStart(2, '0')}.srt`);
+      }
+      function triggerDownload(url, filename) {
+        const a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click();
+        setTimeout(() => a.remove(), 0);
+      }
+
+      function toggleSubs(clip) {
+        if (!clip.withSubsUrl) return;
+        clip.subsActive = !clip.subsActive;
+        render(AppState.clips);
+      }
+
+      async function downloadAll() {
+        for (const clip of AppState.clips) {
+          if (clip.error) continue;
+          downloadClip(clip);
+          if (AppState.settings.subsOutput !== 'burn' && clip.srtUrl) {
+            await new Promise((r) => setTimeout(r, 200));
+            downloadSRT(clip);
+          }
+          await new Promise((r) => setTimeout(r, 300));
+        }
+      }
+
+      function toggleAll(value) {
+        for (const c of AppState.clips) {
+          if (c.withSubsUrl) c.subsActive = value;
+        }
+        render(AppState.clips);
+      }
+
+      // ============= Редактор SRT =============
+      let editingClip = null;
+      function openEditor(clip) {
+        if (!clip.segments) return;
+        editingClip = clip;
+        const root = document.getElementById('srt-editor');
+        document.getElementById('edit-clip-name').textContent = `Клип ${clip.index} · ${VideoProcessor.fmtTime(clip.start)} → ${VideoProcessor.fmtTime(clip.end)}`;
+        document.getElementById('edit-status').textContent = '';
+        root.innerHTML = '';
+        clip.segments.forEach((seg, i) => {
+          const row = document.createElement('div');
+          row.className = 'srt-row';
+          row.innerHTML = `
+            <div class="srt-time">${SubtitleManager.formatSRTTime(seg.start)}<br>${SubtitleManager.formatSRTTime(seg.end)}</div>
+            <textarea class="srt-text" data-i="${i}">${seg.text.replace(/</g, '&lt;')}</textarea>
+          `;
+          root.appendChild(row);
+        });
+        document.getElementById('modal-edit').classList.add('is-open');
+      }
+      function closeEditor() {
+        document.getElementById('modal-edit').classList.remove('is-open');
+        editingClip = null;
+      }
+      async function applyEditor() {
+        if (!editingClip) return;
+        const root = document.getElementById('srt-editor');
+        const segs = editingClip.segments.map((s) => ({ ...s }));
+        root.querySelectorAll('textarea.srt-text').forEach((ta) => {
+          const i = +ta.dataset.i;
+          segs[i].text = ta.value;
+        });
+        const status = document.getElementById('edit-status');
+        try {
+          status.textContent = 'Перерендер…';
+          await VideoProcessor.rerenderWithSubs(editingClip, segs, AppState.settings);
+          status.textContent = 'Готово';
+          render(AppState.clips);
+          UI.toast('Субтитры обновлены', 'ok');
+          closeEditor();
+        } catch (e) {
+          status.textContent = '';
+          UI.toast('Ошибка: ' + (e.message || e), 'err', 6000);
+        }
+      }
+
+      return { render, downloadAll, toggleAll, openEditor, closeEditor, applyEditor, downloadClip, downloadSRT };
+    })();
+
+    // ====================================================================
+    // Главный init: события, экраны, бизнес-логика
+    // ====================================================================
+    function init() {
+
+      // SharedArrayBuffer fallback ----------------------------------------
+      // FFmpeg.wasm под капотом использует pthread/SAB. SAB включается только
+      // если страница cross-origin isolated (COOP/COEP заголовки). Если нет —
+      // показываем подробную инструкцию по запуску локального сервера.
+      const sabOk =
+        typeof SharedArrayBuffer !== 'undefined' &&
+        (typeof crossOriginIsolated === 'undefined' || crossOriginIsolated === true);
+      if (!sabOk) {
+        document.getElementById('app').classList.add('hidden');
+        document.getElementById('fallback').style.display = 'block';
+        return;
+      }
+
+      // Старт с экрана загрузки
+      UI.show('upload');
+
+      // ====== Экран 1: Загрузка ======
+      const dz = document.getElementById('dropzone');
+      const fileInput = document.getElementById('file-input');
+      const previewBlock = document.getElementById('preview-block');
+      const previewVideo = document.getElementById('preview-video');
+      const metaList = document.getElementById('meta-list');
+
+      ['dragenter', 'dragover'].forEach((ev) => {
+        dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('is-dragover'); });
+      });
+      ['dragleave', 'drop'].forEach((ev) => {
+        dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('is-dragover'); });
+      });
+      dz.addEventListener('drop', (e) => {
+        e.preventDefault();
+        const f = e.dataTransfer?.files?.[0];
+        if (f) handleFile(f);
+      });
+      fileInput.addEventListener('change', (e) => {
+        const f = e.target.files?.[0];
+        if (f) handleFile(f);
+      });
+
+      function handleFile(file) {
+        if (!file.type.startsWith('video/')) {
+          UI.toast('Это не похоже на видео-файл', 'warn');
+          return;
+        }
+        // Освободим предыдущий URL если был
+        if (AppState.inputUrl) URL.revokeObjectURL(AppState.inputUrl);
+        AppState.inputFile = file;
+        const url = URL.createObjectURL(file);
+        AppState.inputUrl = url;
+        previewVideo.src = url;
+        previewVideo.onloadedmetadata = () => {
+          const meta = {
+            duration: previewVideo.duration,
+            width: previewVideo.videoWidth,
+            height: previewVideo.videoHeight,
+            size: file.size,
+          };
+          AppState.inputMeta = meta;
+          renderMeta(meta, file);
+          previewBlock.classList.remove('hidden');
+          updateClipsCountWarning();
+        };
+      }
+
+      function renderMeta(meta, file) {
+        const fmtBytes = (b) =>
+          b < 1024 ? b + ' B' :
+          b < 1024 * 1024 ? (b / 1024).toFixed(1) + ' KB' :
+          b < 1024 * 1024 * 1024 ? (b / 1024 / 1024).toFixed(1) + ' MB' :
+          (b / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+        const dur = meta.duration;
+        const h = Math.floor(dur / 3600), m = Math.floor((dur % 3600) / 60), s = Math.floor(dur % 60);
+        metaList.innerHTML = `
+          <li><span class="k">Длительность</span> <span class="v">${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}</span></li>
+          <li><span class="k">Разрешение</span> <span class="v">${meta.width} × ${meta.height}</span></li>
+          <li><span class="k">Размер</span> <span class="v">${fmtBytes(meta.size)}</span></li>
+          <li><span class="k">Файл</span> <span class="v" style="text-align:right;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${file.name}">${file.name}</span></li>
+        `;
+      }
+
+      document.getElementById('btn-reset-upload').addEventListener('click', () => {
+        AppState.inputFile = null;
+        AppState.inputMeta = null;
+        if (AppState.inputUrl) URL.revokeObjectURL(AppState.inputUrl);
+        AppState.inputUrl = null;
+        previewVideo.removeAttribute('src');
+        previewBlock.classList.add('hidden');
+        fileInput.value = '';
+      });
+
+      document.getElementById('btn-go-settings').addEventListener('click', () => {
+        if (!AppState.inputFile) return;
+        UI.show('settings');
+        renderTimeline();
+        updateClipsCountWarning();
+      });
+
+      // ====== Экран 2: Настройки ======
+      const pillRow = document.getElementById('pill-length');
+      pillRow.addEventListener('click', (e) => {
+        const t = e.target.closest('.pill');
+        if (!t) return;
+        pillRow.querySelectorAll('.pill').forEach((p) => p.classList.toggle('is-active', p === t));
+        AppState.settings.clipLength = +t.dataset.v;
+        updateClipsCountWarning();
+      });
+
+      const sliderCount = document.getElementById('slider-count');
+      const valCount = document.getElementById('val-count');
+      sliderCount.addEventListener('input', () => {
+        AppState.settings.clipsCount = +sliderCount.value;
+        valCount.textContent = sliderCount.value;
+        updateClipsCountWarning();
+      });
+
+      const aspectToggle = document.getElementById('aspect-toggle');
+      aspectToggle.addEventListener('click', (e) => {
+        const t = e.target.closest('.aspect-opt');
+        if (!t) return;
+        aspectToggle.querySelectorAll('.aspect-opt').forEach((p) => p.classList.toggle('is-active', p === t));
+        AppState.settings.aspect = t.dataset.v;
+      });
+
+      // Стратегии
+      const stratCards = document.querySelectorAll('.strategy-card');
+      stratCards.forEach((card) => {
+        card.addEventListener('click', () => {
+          stratCards.forEach((c) => c.classList.toggle('is-active', c === card));
+          AppState.settings.strategy = card.dataset.v;
+          document.getElementById('manual-timeline-wrap').classList.toggle('hidden', AppState.settings.strategy !== 'manual');
+        });
+      });
+
+      function renderTimeline() {
+        const tl = document.getElementById('timeline');
+        if (!AppState.inputMeta) return;
+        tl.innerHTML = '<div class="timeline-track"></div>';
+        // Перенесём существующие маркеры
+        AppState.settings.manualMarkers.forEach((m, i) => addMarkerVisual(tl, m, i));
+        tl.onclick = (e) => {
+          if (e.target.classList.contains('rm')) return;
+          const rect = tl.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const ratio = Math.max(0, Math.min(1, x / rect.width));
+          const sec = ratio * AppState.inputMeta.duration;
+          AppState.settings.manualMarkers.push(sec);
+          AppState.settings.manualMarkers.sort((a, b) => a - b);
+          renderTimeline();
+          updateClipsCountWarning();
+        };
+      }
+      function addMarkerVisual(tl, sec, i) {
+        const marker = document.createElement('div');
+        marker.className = 'timeline-marker';
+        const ratio = sec / AppState.inputMeta.duration;
+        marker.style.left = (ratio * 100) + '%';
+        marker.dataset.i = i + 1;
+        marker.innerHTML = '<div class="rm" title="Удалить">×</div>';
+        marker.querySelector('.rm').addEventListener('click', (ev) => {
+          ev.stopPropagation();
+          AppState.settings.manualMarkers.splice(i, 1);
+          renderTimeline();
+          updateClipsCountWarning();
+        });
+        tl.appendChild(marker);
+      }
+
+      // Предупреждение по длине
+      function updateClipsCountWarning() {
+        const dur = AppState.inputMeta?.duration || 0;
+        const len = AppState.settings.clipLength;
+        let count = AppState.settings.clipsCount;
+        if (AppState.settings.strategy === 'manual') count = AppState.settings.manualMarkers.length;
+        const banner = document.getElementById('warn-banner');
+        const max = Math.max(1, Math.floor(dur / len));
+        if (count * len > dur && AppState.settings.strategy !== 'manual') {
+          banner.classList.add('is-visible');
+          banner.textContent = `Видео слишком короткое: при длине клипа ${len}s максимум ${max} клипов. Корректируем автоматически.`;
+          AppState.settings.clipsCount = max;
+          sliderCount.value = max;
+          valCount.textContent = max;
+        } else {
+          banner.classList.remove('is-visible');
+        }
+      }
+
+      // Субтитры — переключатель
+      const cbSubs = document.getElementById('cb-subs');
+      cbSubs.addEventListener('change', () => {
+        AppState.settings.subsEnabled = cbSubs.checked;
+        document.getElementById('subs-block').classList.toggle('is-visible', cbSubs.checked);
+        document.getElementById('subs-style-panel').classList.toggle('is-visible', cbSubs.checked);
+        UI.setPhaseProgress('whisper', 0, cbSubs.checked ? 'ожидаем загрузки' : 'не требуется');
+      });
+
+      // Селекторы языка/модели/формата
+      const segLang = document.getElementById('subs-lang');
+      const segModel = document.getElementById('subs-model');
+      const segOutput = document.getElementById('subs-output');
+      function bindSeg(seg, key) {
+        seg.addEventListener('click', (e) => {
+          const t = e.target.closest('button[data-v]');
+          if (!t) return;
+          seg.querySelectorAll('button').forEach((b) => b.classList.toggle('is-active', b === t));
+          AppState.settings[key] = t.dataset.v;
+        });
+      }
+      bindSeg(segLang, 'subsLang');
+      bindSeg(segModel, 'subsModel');
+      bindSeg(segOutput, 'subsOutput');
+
+      // Стилевые поля
+      const styleInputs = {
+        'ss-family':    { type: 'select', key: 'family' },
+        'ss-size':      { type: 'range', key: 'size', valEl: 'ss-size-val' },
+        'ss-bold':      { type: 'check', key: 'bold' },
+        'ss-italic':    { type: 'check', key: 'italic' },
+        'ss-color':     { type: 'color', key: 'color', hex: 'ss-color-hex' },
+        'ss-outline':   { type: 'color', key: 'outline', hex: 'ss-outline-hex' },
+        'ss-outline-w': { type: 'range', key: 'outlineW', valEl: 'ss-outline-w-val' },
+        'ss-bg-color':  { type: 'color', key: 'bgColor' },
+        'ss-bg-alpha':  { type: 'range', key: 'bgAlpha', valEl: 'ss-bg-alpha-val' },
+        'ss-pad':       { type: 'range', key: 'padding', valEl: 'ss-pad-val' },
+        'ss-margin':    { type: 'range', key: 'margin', valEl: 'ss-margin-val', suffix: '%' },
+      };
+      const styleSegs = {
+        'ss-bg-type': 'bgType',
+        'ss-pos-v':   'posV',
+        'ss-pos-h':   'posH',
+        'ss-anim':    'anim',
+      };
+
+      for (const id in styleInputs) {
+        const el = document.getElementById(id);
+        const cfg = styleInputs[id];
+        if (!el) continue;
+        const handler = () => {
+          let v;
+          if (cfg.type === 'check') v = el.checked;
+          else if (cfg.type === 'range') v = +el.value;
+          else v = el.value;
+          AppState.settings.subsStyle[cfg.key] = v;
+          if (cfg.valEl) {
+            const valEl = document.getElementById(cfg.valEl);
+            if (valEl) valEl.textContent = v + (cfg.suffix || '');
+          }
+          if (cfg.hex) {
+            const hexEl = document.getElementById(cfg.hex);
+            if (hexEl) hexEl.value = v;
+          }
+          updatePreview();
+        };
+        if (cfg.type === 'check') el.addEventListener('change', handler);
+        else if (cfg.type === 'range') el.addEventListener('input', handler);
+        else if (cfg.type === 'color') {
+          el.addEventListener('input', handler);
+          if (cfg.hex) {
+            const hexEl = document.getElementById(cfg.hex);
+            hexEl.addEventListener('input', () => {
+              if (/^#?[0-9a-fA-F]{6}$/.test(hexEl.value.trim())) {
+                const v = hexEl.value.trim().startsWith('#') ? hexEl.value.trim() : '#' + hexEl.value.trim();
+                el.value = v;
+                AppState.settings.subsStyle[cfg.key] = v;
+                updatePreview();
+              }
+            });
+          }
+        }
+        else if (cfg.type === 'select') el.addEventListener('change', handler);
+      }
+      for (const id in styleSegs) {
+        const seg = document.getElementById(id);
+        if (!seg) continue;
+        seg.addEventListener('click', (e) => {
+          const t = e.target.closest('button[data-v]');
+          if (!t) return;
+          seg.querySelectorAll('button').forEach((b) => b.classList.toggle('is-active', b === t));
+          AppState.settings.subsStyle[styleSegs[id]] = t.dataset.v;
+          updatePreview();
+        });
+      }
+
+      function updatePreview() {
+        const sub = document.getElementById('preview-sub');
+        const css = SubtitleManager.buildPreviewCSS(AppState.settings.subsStyle);
+        for (const k in css) sub.style[k] = css[k];
+      }
+      updatePreview();
+
+      // Пресеты
+      document.querySelectorAll('.preset-btn').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const p = SubtitleManager.PRESETS[btn.dataset.preset];
+          if (!p) return;
+          AppState.settings.subsStyle = { ...p };
+          // Обновляем поля
+          syncStyleUI();
+          UI.toast(`Пресет «${btn.textContent}» применён`, 'ok');
+        });
+      });
+      function syncStyleUI() {
+        const s = AppState.settings.subsStyle;
+        const setVal = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+        const setText = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+        setVal('ss-family', s.family);
+        setVal('ss-size', s.size); setText('ss-size-val', s.size);
+        document.getElementById('ss-bold').checked = !!s.bold;
+        document.getElementById('ss-italic').checked = !!s.italic;
+        setVal('ss-color', s.color); setVal('ss-color-hex', s.color);
+        setVal('ss-outline', s.outline); setVal('ss-outline-hex', s.outline);
+        setVal('ss-outline-w', s.outlineW); setText('ss-outline-w-val', s.outlineW);
+        setVal('ss-bg-color', s.bgColor);
+        setVal('ss-bg-alpha', s.bgAlpha); setText('ss-bg-alpha-val', s.bgAlpha);
+        setVal('ss-pad', s.padding); setText('ss-pad-val', s.padding);
+        setVal('ss-margin', s.margin); setText('ss-margin-val', s.margin + '%');
+        const segPick = (segId, v) => {
+          document.querySelectorAll('#' + segId + ' button').forEach((b) => b.classList.toggle('is-active', b.dataset.v === v));
+        };
+        segPick('ss-bg-type', s.bgType);
+        segPick('ss-pos-v', s.posV);
+        segPick('ss-pos-h', s.posH);
+        segPick('ss-anim', s.anim);
+        updatePreview();
+      }
+
+      document.getElementById('btn-back-upload').addEventListener('click', () => UI.show('upload'));
+
+      // ====== Экран 3: Обработка ======
+      document.getElementById('btn-start').addEventListener('click', startProcessing);
+      document.getElementById('btn-cancel').addEventListener('click', async () => {
+        if (!AppState.processing || AppState.cancelRequested) return;
+        AppState.cancelRequested = true;
+        UI.toast('Отменяем…', 'warn');
+        // Прибиваем FFmpeg, чтобы прервать текущий ffmpeg.run() мгновенно.
+        // На следующий старт init() поднимет его заново.
+        try { await FFmpegCore.exit(); } catch (_) {}
+      });
+
+      async function startProcessing() {
+        if (!AppState.inputFile) return;
+        // Проверка плана
+        const plan = VideoProcessor.calcPlan(
+          AppState.settings.strategy,
+          AppState.settings.clipLength,
+          AppState.settings.clipsCount,
+          AppState.inputMeta.duration,
+          AppState.settings.manualMarkers
+        );
+        if (plan.length === 0) {
+          UI.toast('Нечего нарезать. Проверьте настройки/маркеры', 'warn');
+          return;
+        }
+
+        AppState.processing = true;
+        AppState.cancelRequested = false;
+        // Очистка прошлых результатов
+        cleanupBlobs();
+        AppState.clips = [];
+
+        UI.show('processing');
+        UI.setTotalProgress(0);
+        UI.setPhaseProgress('ffmpeg', 0, 'инициализация…');
+        UI.setPhaseProgress('whisper', 0, AppState.settings.subsEnabled ? 'ожидаем' : 'не требуется');
+        UI.setPhaseProgress('clip', 0, '');
+        UI.setPhaseProgress('sub', 0, AppState.settings.subsEnabled ? '' : 'не требуется');
+
+        document.getElementById('proc-summary').textContent =
+          `${plan.length} клип(ов) · ${AppState.settings.clipLength}s · ${AppState.settings.aspect}` +
+          (AppState.settings.subsEnabled ? ` · субтитры: ${AppState.settings.subsModel}` : '');
+
+        // ---- Загрузка FFmpeg ----
+        try {
+          await FFmpegCore.init((frac) => {
+            UI.setPhaseProgress('ffmpeg', frac * 100, 'скачиваем core…');
+          });
+          UI.setPhaseProgress('ffmpeg', 100, AppState.ffmpegFromCache ? 'из кеша ⚡' : 'готово');
+        } catch (e) {
+          UI.toast('FFmpeg не загрузился: ' + e.message, 'err', 6000);
+          UI.show('settings');
+          AppState.processing = false;
+          return;
+        }
+
+        // ---- Загрузка Whisper ----
+        if (AppState.settings.subsEnabled) {
+          try {
+            UI.setPhaseProgress('whisper', 1, 'скачиваем модель…');
+            await WhisperCore.load(AppState.settings.subsModel, (frac, data) => {
+              UI.setPhaseProgress('whisper', Math.round(frac * 100), data?.file ? data.file : 'модель');
+            });
+            UI.setPhaseProgress('whisper', 100, AppState.whisperFromCache ? 'из кеша ⚡' : 'готово');
+          } catch (e) {
+            console.error(e);
+            UI.toast('Whisper не загрузился: ' + e.message + '. Продолжаем без субтитров.', 'warn', 6000);
+            AppState.settings.subsEnabled = false;
+            UI.setPhaseProgress('whisper', 0, 'ошибка — пропускаем');
+          }
+        }
+
+        // ---- Прогресс FFmpeg внутри ffmpeg.run ----
+        const offFFmpeg = EventBus.on('ffmpeg:progress', (p) => {
+          if (typeof p.ratio === 'number') {
+            // p.ratio in [0..1] — текущая операция
+            UI.setPhaseProgress('clip',
+              Math.min(99, Math.round(p.ratio * 100)),
+              undefined
+            );
+          }
+        });
+
+        // ---- Нарезка ----
+        try {
+          const results = await VideoProcessor.process({
+            file: AppState.inputFile,
+            settings: AppState.settings,
+            plan,
+            onPhase: (phase, info) => {
+              if (phase === 'clip') {
+                UI.setPhaseProgress('clip', 0, info.label || '');
+              } else if (phase === 'sub') {
+                UI.setPhaseProgress('sub', info.pct ?? 0, info.label || '');
+              }
+            },
+            onTotal: (frac) => UI.setTotalProgress(frac),
+          });
+          UI.setPhaseProgress('clip', 100, 'готово');
+          UI.setPhaseProgress('sub', AppState.settings.subsEnabled ? 100 : 0, AppState.settings.subsEnabled ? 'готово' : '');
+
+          AppState.clips = results;
+          UI.show('results');
+          GalleryManager.render(results);
+          if (AppState.cancelRequested) {
+            UI.toast('Отменено пользователем', 'warn');
+          } else {
+            UI.toast(`Готово: ${results.filter((r) => !r.error).length} клип(ов)`, 'ok');
+          }
+        } catch (e) {
+          console.error(e);
+          UI.toast('Ошибка обработки: ' + (e.message || e), 'err', 6000);
+          UI.show('settings');
+        } finally {
+          offFFmpeg();
+          AppState.processing = false;
+        }
+      }
+
+      // Повторить отдельный клип
+      EventBus.on('clip:retry', async (clip) => {
+        UI.toast('Повторная попытка…', 'ok');
+        // Простейший подход: пересоздадим клип с теми же сегментами
+        const i = AppState.clips.findIndex((c) => c.index === clip.index);
+        if (i < 0) return;
+        const seg = { start: clip.start, end: clip.end };
+        try {
+          // Запишем input заново
+          const buf = new Uint8Array(await AppState.inputFile.arrayBuffer());
+          const inputName = 'reinput.' + (AppState.inputFile.name.split('.').pop() || 'mp4');
+          await FFmpegCore.writeFile(inputName, buf);
+          const dur = seg.end - seg.start;
+          const clipName = `retry_${clip.index}.mp4`;
+          if (AppState.settings.aspect === '9:16') {
+            await FFmpegCore.run([
+              '-ss', String(seg.start), '-i', inputName, '-t', String(dur),
+              '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+              clipName,
+            ]);
+          } else {
+            await FFmpegCore.run([
+              '-ss', String(seg.start), '-i', inputName, '-t', String(dur),
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+              clipName,
+            ]);
+          }
+          const data = await FFmpegCore.readFile(clipName);
+          const blob = new Blob([data.buffer], { type: 'video/mp4' });
+          const url = URL.createObjectURL(blob);
+          AppState.blobUrls.add(url);
+          await FFmpegCore.unlink(clipName);
+          await FFmpegCore.unlink(inputName);
+          AppState.clips[i] = {
+            index: clip.index, start: seg.start, end: seg.end, size: blob.size,
+            originalUrl: url, originalBlob: blob, withSubsUrl: null,
+            error: null, subsActive: false,
+          };
+          GalleryManager.render(AppState.clips);
+          UI.toast('Готово', 'ok');
+        } catch (e) {
+          UI.toast('Не получилось: ' + e.message, 'err', 6000);
+        }
+      });
+
+      // ====== Экран 4: Результаты ======
+      document.getElementById('btn-restart').addEventListener('click', () => {
+        cleanupBlobs();
+        AppState.clips = [];
+        UI.show('upload');
+      });
+      document.getElementById('btn-download-all').addEventListener('click', () => GalleryManager.downloadAll());
+      document.getElementById('btn-toggle-all-on').addEventListener('click', () => GalleryManager.toggleAll(true));
+      document.getElementById('btn-toggle-all-off').addEventListener('click', () => GalleryManager.toggleAll(false));
+
+      // Модалка редактора
+      document.getElementById('btn-edit-close').addEventListener('click', GalleryManager.closeEditor);
+      document.getElementById('btn-edit-cancel').addEventListener('click', GalleryManager.closeEditor);
+      document.getElementById('btn-edit-apply').addEventListener('click', GalleryManager.applyEditor);
+
+      // Закрытие модалки по фону
+      document.getElementById('modal-edit').addEventListener('click', (e) => {
+        if (e.target.id === 'modal-edit') GalleryManager.closeEditor();
+      });
+
+      // ESC — закрыть модалку
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') GalleryManager.closeEditor();
+      });
+
+      // Очистка blob URL'ов при «начать заново»
+      function cleanupBlobs() {
+        AppState.blobUrls.forEach((u) => URL.revokeObjectURL(u));
+        AppState.blobUrls.clear();
+        // Чистим input в FFmpeg FS на всякий случай
+        if (AppState.ffmpegReady) {
+          try { FFmpegCore.unlink('input.mp4'); } catch (_) {}
+        }
+      }
+
+      // Пульсация кнопки «Начать нарезку» пока FFmpeg не готов
+      const btnStart = document.getElementById('btn-start');
+      btnStart.classList.add('is-pulse');
+      const pulseStop = () => btnStart.classList.remove('is-pulse');
+      EventBus.on('ffmpeg:ready', pulseStop);
+      // Уберём пульсацию когда стартует обработка тоже
+      btnStart.addEventListener('click', pulseStop);
+    }
+
+    // Запуск приложения
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  </script>
+</body>
+</html>
