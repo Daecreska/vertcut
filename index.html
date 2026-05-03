@@ -1393,6 +1393,11 @@
       let ffmpeg = null;
       let progressFraction = 0;
       let fontBlobCache = null;
+      // Циклический буфер последних строк FFmpeg-лога. При ошибке мы
+      // включаем последние ~12 строк в текст исключения — иначе ffmpeg.run
+      // бросает голое «ffmpeg.wasm was killed by signal X» без контекста.
+      const LOG_BUF_SIZE = 24;
+      let logBuf = [];
 
       // Качаем все нужные файлы (FFmpeg-обёртку + 3 core-файла), кешируем в IDB.
       async function fetchAllWithCache(onProgress) {
@@ -1481,6 +1486,15 @@
         ffmpeg = createFFmpeg({
           log: false,
           corePath, wasmPath, workerPath,
+          // Не плюём в console (log:false), но забираем в буфер — это даёт
+          // понятные сообщения об ошибках вроде «No such file or directory»,
+          // «Invalid data found when processing input» и т.п.
+          logger: ({ type, message }) => {
+            if (type === 'fferr' || type === 'ffout') {
+              logBuf.push(message);
+              if (logBuf.length > LOG_BUF_SIZE) logBuf.shift();
+            }
+          },
           progress: (p) => {
             if (typeof p.ratio === 'number') progressFraction = p.ratio;
             EventBus.emit('ffmpeg:progress', p);
@@ -1520,11 +1534,29 @@
         ffmpeg.FS('writeFile', `/fonts/${FONT_FS_NAME}`, buf);
       }
 
+      function lastLogLines(n = 6) {
+        return logBuf.slice(-n).join(' | ');
+      }
+
       // Прямые операции без RPC — FFmpeg.wasm и так делегирует тяжёлое
       // в свой собственный Worker, мы здесь только дирижёр.
       async function run(args) {
         if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
-        await ffmpeg.run(...args);
+        // Перед каждым запуском чистим буфер, чтобы lastLogLines() в обработке
+        // ошибок отдавал именно эту операцию, а не предыдущую.
+        logBuf = [];
+        try {
+          await ffmpeg.run(...args);
+        } catch (e) {
+          const tail = lastLogLines(6);
+          if (tail) {
+            const msg = (e && e.message) ? e.message : String(e);
+            const err = new Error(`${msg} (${tail})`);
+            err.cause = e;
+            throw err;
+          }
+          throw e;
+        }
       }
       async function writeFile(name, data) {
         if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
@@ -1550,7 +1582,7 @@
 
       return {
         init, run, writeFile, readFile, unlink, exit,
-        ensureFontInFS,
+        ensureFontInFS, lastLogLines,
         getProgressFraction: () => progressFraction,
       };
     })();
@@ -1566,18 +1598,31 @@
         const { pipeline } = await loadTransformers();
         if (pipe && currentModel === modelSize) return pipe;
         const modelName = modelSize === 'base' ? 'Xenova/whisper-base' : 'Xenova/whisper-tiny';
-        let lastSeen = 0;
+        // Агрегируем прогресс по нескольким файлам модели (encoder, decoder,
+        // tokenizer, config и т.д.) взвешенно по байтам. Иначе progress
+        // прыгает 0→100→0→100 при переходе между файлами.
+        const fileStats = Object.create(null);
         let cacheHit = true;
         pipe = await pipeline('automatic-speech-recognition', modelName, {
           progress_callback: (data) => {
             // data: { status, name, file, progress, loaded, total }
             if (data.status === 'download' || data.status === 'progress') cacheHit = false;
-            if (typeof data.progress === 'number') {
-              lastSeen = Math.max(lastSeen, data.progress / 100);
-              onProgress && onProgress(lastSeen, data);
-            } else if (data.status === 'ready' || data.status === 'done') {
-              onProgress && onProgress(1, data);
+            if (data.file && typeof data.loaded === 'number' && typeof data.total === 'number' && data.total > 0) {
+              fileStats[data.file] = { loaded: data.loaded, total: data.total };
             }
+            // Считаем общий прогресс: сумма loaded / сумма total среди известных файлов.
+            const keys = Object.keys(fileStats);
+            let frac = 0;
+            if (keys.length > 0) {
+              let l = 0, t = 0;
+              for (const k of keys) { l += fileStats[k].loaded; t += fileStats[k].total; }
+              frac = t > 0 ? Math.min(0.99, l / t) : 0;
+            } else if (typeof data.progress === 'number') {
+              // Фоллбэк: если в этом колбэке нет loaded/total, берём поле progress напрямую.
+              frac = Math.min(0.99, data.progress / 100);
+            }
+            if (data.status === 'ready' || data.status === 'done') frac = 1;
+            onProgress && onProgress(frac, data);
           },
         });
         currentModel = modelSize;
@@ -2032,7 +2077,28 @@
                   pct: 30,
                 });
 
-                const tr = await WhisperCore.transcribe(audio16, settings.subsLang);
+                // Whisper-инференция не выдаёт промежуточный прогресс.
+                // Дёргаем «эмуляцию активности» каждые 600мс — пользователь видит
+                // что процесс жив, а не завис.
+                const startTr = performance.now();
+                let tickFrac = 0.30;
+                const tick = setInterval(() => {
+                  // Логистическая функция: быстрый рост вначале, затем замедление,
+                  // максимум ~0.65 (35→65). Дальше прыгает на 70 при вжигании.
+                  const dt = (performance.now() - startTr) / 1000;
+                  tickFrac = Math.min(0.65, 0.30 + (1 - Math.exp(-dt / 8)) * 0.35);
+                  onPhase('sub', {
+                    i: i + 1, total: totalSteps,
+                    label: `Whisper · клип ${i + 1}/${totalSteps} · ${dt.toFixed(0)}s`,
+                    pct: Math.round(tickFrac * 100),
+                  });
+                }, 600);
+                let tr;
+                try {
+                  tr = await WhisperCore.transcribe(audio16, settings.subsLang);
+                } finally {
+                  clearInterval(tick);
+                }
                 const chunks = (tr && tr.chunks) ? tr.chunks : [];
                 const cleanChunks = chunks.filter((c) => c && c.text && c.text.trim().length > 0);
                 if (cleanChunks.length === 0) {
@@ -2276,11 +2342,18 @@
             `;
           } else {
             const url = pickUrl(clip);
+            // Тег: «Субтитры» если активен with-subs, «SRT» если есть только srt-файл,
+            // «Речь не обнаружена» если Whisper отработал, но не нашёл речи.
+            const subTag = clip.subsActive && clip.withSubsUrl
+              ? '<div class="clip-tag">🔤 Субтитры</div>'
+              : (clip.srtUrl && !clip.withSubsUrl
+                  ? '<div class="clip-tag" style="background:rgba(124,154,255,0.25);color:#b9c7ff;">📝 SRT</div>'
+                  : '');
             card.innerHTML = `
               <div class="clip-video-wrap ${isVertical ? '' : 'h-mode'}">
-                ${clip.subsActive && clip.withSubsUrl ? '<div class="clip-tag">🔤 Субтитры</div>' : ''}
+                ${subTag}
                 ${clip.noSpeech ? '<div class="clip-tag" style="background:rgba(245,197,74,0.2);color:#ffd97a;">Речь не обнаружена</div>' : ''}
-                <video src="${url}" controls loop muted playsinline></video>
+                <video src="${url}" controls loop muted playsinline preload="metadata"></video>
               </div>
               <div class="clip-body">
                 <div class="clip-meta">
@@ -2383,7 +2456,10 @@
         document.getElementById('modal-edit').classList.remove('is-open');
         editingClip = null;
       }
+      let applyInFlight = false;
       async function applyEditor() {
+        // Защита от двойного клика — render может занимать секунды.
+        if (applyInFlight) return;
         if (!editingClip) return;
         const root = document.getElementById('srt-editor');
         const segs = editingClip.segments.map((s) => ({ ...s }));
@@ -2392,6 +2468,13 @@
           segs[i].text = ta.value;
         });
         const status = document.getElementById('edit-status');
+        const applyBtn = document.getElementById('btn-edit-apply');
+        const cancelBtn = document.getElementById('btn-edit-cancel');
+        applyInFlight = true;
+        applyBtn.disabled = true;
+        cancelBtn.disabled = true;
+        const oldLabel = applyBtn.textContent;
+        applyBtn.textContent = 'Перерендер…';
         try {
           status.textContent = 'Перерендер…';
           await VideoProcessor.rerenderWithSubs(editingClip, segs, AppState.settings);
@@ -2402,6 +2485,11 @@
         } catch (e) {
           status.textContent = '';
           UI.toast('Ошибка: ' + (e.message || e), 'err', 6000);
+        } finally {
+          applyInFlight = false;
+          applyBtn.disabled = false;
+          cancelBtn.disabled = false;
+          applyBtn.textContent = oldLabel;
         }
       }
 
@@ -2741,10 +2829,13 @@
       document.getElementById('btn-back-upload').addEventListener('click', () => UI.show('upload'));
 
       // ====== Экран 3: Обработка ======
+      const btnCancel = document.getElementById('btn-cancel');
       document.getElementById('btn-start').addEventListener('click', startProcessing);
-      document.getElementById('btn-cancel').addEventListener('click', async () => {
+      btnCancel.addEventListener('click', async () => {
         if (!AppState.processing || AppState.cancelRequested) return;
         AppState.cancelRequested = true;
+        btnCancel.disabled = true;
+        btnCancel.textContent = 'Отменяем…';
         UI.toast('Отменяем…', 'warn');
         // Прибиваем FFmpeg, чтобы прервать текущий ffmpeg.run() мгновенно.
         // На следующий старт init() поднимет его заново.
@@ -2752,6 +2843,9 @@
       });
 
       async function startProcessing() {
+        // Защита от двойного клика — пока идёт обработка, повторный клик
+        // не должен запускать второй пайплайн поверх первого.
+        if (AppState.processing) return;
         if (!AppState.inputFile) return;
         // Проверка плана
         const plan = VideoProcessor.calcPlan(
@@ -2768,6 +2862,9 @@
 
         AppState.processing = true;
         AppState.cancelRequested = false;
+        // Сброс состояния кнопки отмены — она могла остаться disabled с прошлого запуска
+        btnCancel.disabled = false;
+        btnCancel.textContent = 'Отменить';
         // Очистка прошлых результатов
         cleanupBlobs();
         AppState.clips = [];
