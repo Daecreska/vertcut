@@ -1981,6 +1981,12 @@
             }
 
             const clipData = await FFmpegCore.readFile(clipName);
+            // Защита от пустого вывода: если FFmpeg по какой-то причине
+            // отработал без ошибки, но не записал ни одного байта,
+            // покажем явную ошибку вместо «битой» карточки на 0 B.
+            if (!clipData || clipData.byteLength === 0) {
+              throw new Error('FFmpeg создал пустой файл. Проверьте, что входное видео не повреждено.');
+            }
             const clipBlob = new Blob([clipData.buffer], { type: 'video/mp4' });
             const clipUrl = URL.createObjectURL(clipBlob);
             AppState.blobUrls.add(clipUrl);
@@ -2064,6 +2070,13 @@
                       finalName,
                     ]);
                     const finalData = await FFmpegCore.readFile(finalName);
+                    // Аналогичная защита от пустого вывода: если ffmpeg
+                    // не записал ни одного байта (например, libass упал
+                    // на нечитаемом шрифте), не сохраняем «битый» blob —
+                    // карточка останется с оригинальным клипом и subsError.
+                    if (!finalData || finalData.byteLength === 0) {
+                      throw new Error('FFmpeg вернул пустой файл при вжигании субтитров.');
+                    }
                     const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
                     const finalUrl = URL.createObjectURL(finalBlob);
                     AppState.blobUrls.add(finalUrl);
@@ -2128,6 +2141,9 @@
           '-c:a', 'copy', finalName,
         ]);
         const finalData = await FFmpegCore.readFile(finalName);
+        if (!finalData || finalData.byteLength === 0) {
+          throw new Error('FFmpeg вернул пустой файл при перерендере субтитров.');
+        }
         const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
         const finalUrl = URL.createObjectURL(finalBlob);
         AppState.blobUrls.add(finalUrl);
