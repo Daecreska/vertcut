@@ -2281,17 +2281,19 @@
         const phase = document.getElementById('phase-' + phaseId);
         const pctEl = document.getElementById('pct-' + phaseId);
         const metaEl = document.getElementById('meta-' + phaseId);
-        if (pctEl) pctEl.textContent = Math.round(pct) + '%';
+        const safe = Number.isFinite(pct) ? Math.max(0, Math.min(100, pct)) : 0;
+        if (pctEl) pctEl.textContent = Math.round(safe) + '%';
         if (metaEl && meta != null) metaEl.textContent = meta;
         if (phase) {
-          phase.classList.toggle('is-active', pct > 0 && pct < 100);
-          phase.classList.toggle('is-done', pct >= 100);
+          phase.classList.toggle('is-active', safe > 0 && safe < 100);
+          phase.classList.toggle('is-done', safe >= 100);
         }
       }
 
       function setTotalProgress(frac) {
         const el = document.getElementById('total-progress');
-        if (el) el.style.width = Math.round(frac * 100) + '%';
+        const safe = Number.isFinite(frac) ? Math.max(0, Math.min(1, frac)) : 0;
+        if (el) el.style.width = Math.round(safe * 100) + '%';
       }
 
       return { show, toast, setPhaseProgress, setTotalProgress };
@@ -2911,12 +2913,12 @@
 
         // ---- Прогресс FFmpeg внутри ffmpeg.run ----
         const offFFmpeg = EventBus.on('ffmpeg:progress', (p) => {
-          if (typeof p.ratio === 'number') {
-            // p.ratio in [0..1] — текущая операция
-            UI.setPhaseProgress('clip',
-              Math.min(99, Math.round(p.ratio * 100)),
-              undefined
-            );
+          if (typeof p.ratio === 'number' && Number.isFinite(p.ratio)) {
+            // p.ratio in [0..1] — текущая операция; ffmpeg иногда
+            // выдаёт значения за границами при коротких отрезках,
+            // поэтому жёстко клампим в [0, 99].
+            const pct = Math.max(0, Math.min(99, Math.round(p.ratio * 100)));
+            UI.setPhaseProgress('clip', pct, undefined);
           }
         });
 
