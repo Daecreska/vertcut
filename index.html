@@ -39,6 +39,14 @@
        Грузим как можно раньше — он один раз перезагрузит страницу при первом визите. -->
   <script src="coi-serviceworker.js"></script>
 
+  <!-- mp4box.js — JS-демуксер MP4 / WebM. Используется для пробинга кодека входа
+       (детектим AV1) и для транскода AV1→H.264 через WebCodecs API. -->
+  <script src="https://cdn.jsdelivr.net/npm/mp4box@0.5.4/dist/mp4box.all.min.js" crossorigin="anonymous"></script>
+
+  <!-- mp4-muxer — JS-мультиплексор MP4. Собирает H.264 + AAC поток обратно в MP4
+       после транскода через WebCodecs. UMD-сборка, кладёт в global Mp4Muxer. -->
+  <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.js" crossorigin="anonymous"></script>
+
   <!-- Inline SVG-favicon (градиентный «V»), чтобы не получать 404 на /favicon.ico -->
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='1' y2='1'%3E%3Cstop offset='0' stop-color='%23e63950'/%3E%3Cstop offset='1' stop-color='%23ff8c42'/%3E%3C/linearGradient%3E%3C/defs%3E%3Crect width='64' height='64' rx='14' fill='url(%23g)'/%3E%3Cpath d='M16 18 L32 46 L48 18' stroke='white' stroke-width='6' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3C/svg%3E" />
 
@@ -274,6 +282,24 @@
     .meta-list li:last-child { border-bottom: none; }
     .meta-list .k { color: var(--text-dim); font-size: 13px; }
     .meta-list .v { font-family: 'JetBrains Mono', monospace; font-size: 14px; }
+
+    /* Codec-бейдж: показывается под meta-list. Зелёный — совместимый кодек, оранжевый — AV1 (нужен транскод). */
+    .codec-badge {
+      margin: 12px 0 0;
+      padding: 10px 12px;
+      border-radius: 10px;
+      font-size: 13px;
+      line-height: 1.4;
+      border: 1px solid var(--border);
+      background: rgba(40, 200, 100, 0.08);
+      color: rgba(160, 240, 190, 0.95);
+    }
+    .codec-badge.is-warn {
+      background: rgba(255, 140, 66, 0.10);
+      color: rgba(255, 200, 160, 0.98);
+      border-color: rgba(255, 140, 66, 0.35);
+    }
+    .codec-badge .codec-tag { font-family: 'JetBrains Mono', monospace; font-weight: 600; }
 
     /* ======================================================================
        ЭКРАН 2: НАСТРОЙКИ
@@ -885,10 +911,38 @@
         <div class="panel">
           <h3 class="panel-title">Метаданные</h3>
           <ul class="meta-list" id="meta-list"></ul>
+          <div class="codec-badge hidden" id="codec-badge"></div>
           <div class="btn-row">
             <button class="btn btn-ghost" id="btn-reset-upload">Сменить файл</button>
             <button class="btn btn-primary" id="btn-go-settings">Далее → Настройки</button>
           </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================ ЭКРАН 1.5: ТРАНСКОДИРОВАНИЕ AV1 → H.264 ================
+         Показывается перед настройками, если на входе AV1: сборка ffmpeg.wasm
+         0.11.6 не имеет AV1-декодера, поэтому без транскода нарезать не получится.
+         Используем браузерный VideoDecoder (Chrome декодит AV1 нативно через
+         libdav1d) → VideoEncoder (avc1.42E01F, H.264 Baseline) и mp4-muxer для
+         сборки выходного MP4. Аудио (AAC) копируем без перекодирования. -->
+    <section class="screen" id="screen-transcoding" data-screen="transcoding">
+      <div class="panel progress-card">
+        <h2 style="margin:0 0 4px;">Конвертация AV1 → H.264</h2>
+        <p class="muted small" id="trans-summary">FFmpeg.wasm не умеет декодировать AV1 напрямую, поэтому браузер сам перекодирует видео в совместимый формат. Это занимает примерно столько же времени, сколько длится сам ролик.</p>
+
+        <div class="progress-bar total-bar"><div id="trans-progress"></div></div>
+
+        <div style="margin-top:18px;">
+          <div class="phase" id="phase-trans">
+            <div class="phase-num">⚡</div>
+            <div class="phase-name"><div>Декодирование AV1 + Энкодинг H.264 (avc1.42E01F)</div><div class="meta" id="meta-trans">…</div></div>
+            <div class="phase-pct mono" id="pct-trans">0%</div>
+          </div>
+        </div>
+
+        <div class="btn-row right">
+          <button class="btn btn-danger" id="btn-cancel-trans">Отменить</button>
         </div>
       </div>
     </section>
@@ -1263,6 +1317,8 @@
       inputFile: null,
       inputUrl: null,
       inputMeta: null,        // { duration, width, height, size, fps? }
+      inputCodecProbe: null,  // { videoCodec, audioCodec, width, height, duration } — заполняется MP4Box после загрузки
+      transcodeAbort: null,   // AbortController, активный при идущем AV1→H.264 транскоде
 
       // Настройки нарезки
       settings: {
@@ -1846,6 +1902,387 @@
       }
 
       return { PRESETS, chunksToSRT, parseSRT, segmentsToSRT, formatSRTTime, buildForceStyle, buildPreviewCSS };
+    })();
+
+    // ====================================================================
+    // Transcoder — браузерный AV1→H.264 транскод через WebCodecs
+    // --------------------------------------------------------------------
+    // ffmpeg.wasm @0.11.6 / @ffmpeg/core@0.11.0 собран без AV1-декодера
+    // (только H264/HEVC/VP9), поэтому AV1-входы нужно перекодировать в H.264
+    // ДО загрузки в ffmpeg. Делаем это нативно в браузере:
+    //   MP4Box.js          → демукс AV1 + AAC из MP4
+    //   VideoDecoder       → AV1 chunks → VideoFrame (Chrome декодит через libdav1d)
+    //   VideoEncoder       → VideoFrame → H.264 chunks (avc1.42E01F, Baseline)
+    //   mp4-muxer          → собирает H.264 + копию AAC → новый MP4
+    // Аудио (AAC) не перекодируем — копируем сэмплы напрямую через
+    // muxer.addAudioChunkRaw() с дескриптором из esds-бокса исходника.
+    // ====================================================================
+    const Transcoder = (() => {
+
+      // Доступность WebCodecs + AV1 декодера в текущем браузере
+      function isAvailable() {
+        return (
+          typeof window.MP4Box !== 'undefined' &&
+          typeof window.Mp4Muxer !== 'undefined' &&
+          typeof window.VideoDecoder === 'function' &&
+          typeof window.VideoEncoder === 'function' &&
+          typeof window.EncodedVideoChunk === 'function'
+        );
+      }
+
+      // Парсит первые байты файла через MP4Box, чтобы вытянуть кодек видеотрека.
+      // Возвращает { videoCodec, audioCodec, width, height, duration } или null
+      // при ошибке. Не подтверждает 100% валидность файла — только вид кодека.
+      async function probeCodec(file) {
+        if (typeof window.MP4Box === 'undefined') return null;
+        return new Promise((resolve) => {
+          let resolved = false;
+          const finalize = (info) => {
+            if (resolved) return;
+            resolved = true;
+            resolve(info);
+          };
+          try {
+            const mp4box = MP4Box.createFile();
+            mp4box.onError = () => finalize(null);
+            mp4box.onReady = (info) => {
+              const vt = info.videoTracks && info.videoTracks[0];
+              const at = info.audioTracks && info.audioTracks[0];
+              finalize({
+                videoCodec: vt ? vt.codec : null,
+                audioCodec: at ? at.codec : null,
+                width: vt && vt.video ? vt.video.width : null,
+                height: vt && vt.video ? vt.video.height : null,
+                duration: info.duration && info.timescale ? info.duration / info.timescale : null,
+                rawInfo: info,
+              });
+            };
+            // Читаем файл потоком, чтобы не грузить весь сразу — нам нужны только moov-боксы.
+            const reader = file.stream().getReader();
+            let offset = 0;
+            (async function pump() {
+              try {
+                while (true) {
+                  const { value, done } = await reader.read();
+                  if (done) break;
+                  const ab = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+                  ab.fileStart = offset;
+                  offset += value.byteLength;
+                  mp4box.appendBuffer(ab);
+                  if (resolved) {
+                    try { reader.cancel(); } catch (_) {}
+                    return;
+                  }
+                }
+                mp4box.flush();
+                finalize(null); // EOF без onReady → не MP4 / нет moov
+              } catch (_) {
+                finalize(null);
+              }
+            })();
+            // Таймаут на случай битого файла — 8 секунд
+            setTimeout(() => finalize(null), 8000);
+          } catch (_) {
+            finalize(null);
+          }
+        });
+      }
+
+      function isAV1(codec) {
+        return typeof codec === 'string' && codec.toLowerCase().startsWith('av01');
+      }
+
+      // Извлекает avc1/hvc1/vpc/av1C-описание из stsd-бокса трека.
+      // Нужно как `description` для VideoDecoder.configure().
+      // mp4box.all.min.js экспортирует DataStream как глобальный класс window.DataStream
+      // (а не как MP4Box.DataStream), поэтому используем глобал напрямую.
+      function extractDescription(mp4box, track) {
+        const trak = mp4box.getTrackById(track.id);
+        if (!trak || !trak.mdia || !trak.mdia.minf || !trak.mdia.minf.stbl || !trak.mdia.minf.stbl.stsd) return null;
+        for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+          const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+          if (box) {
+            const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+            box.write(stream);
+            return new Uint8Array(stream.buffer, 8); // вырезаем 8-байтный заголовок box
+          }
+        }
+        return null;
+      }
+
+      // Извлекает AAC AudioSpecificConfig из esds-бокса аудиотрека.
+      // Нужно для пасстру-копирования AAC в выходной MP4 через mp4-muxer.
+      function extractAudioConfig(mp4box, track) {
+        const trak = mp4box.getTrackById(track.id);
+        if (!trak || !trak.mdia || !trak.mdia.minf || !trak.mdia.minf.stbl || !trak.mdia.minf.stbl.stsd) return null;
+        for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+          if (entry.esds) {
+            // mp4box.js парсит esds → entry.esds.esd → массив дескрипторов.
+            // Дескриптор tag=5 (DecoderSpecificInfo) содержит AudioSpecificConfig.
+            const findDsi = (desc) => {
+              if (!desc) return null;
+              if (desc.tag === 5 && desc.data) return desc.data;
+              if (desc.descs && desc.descs.length) {
+                for (const d of desc.descs) {
+                  const r = findDsi(d);
+                  if (r) return r;
+                }
+              }
+              return null;
+            };
+            const dsi = findDsi(entry.esds.esd);
+            if (dsi) return dsi instanceof Uint8Array ? dsi : new Uint8Array(dsi);
+          }
+        }
+        return null;
+      }
+
+      // Главная функция транскода. Возвращает новый File ('input_h264.mp4').
+      // onProgress(0..1) — колбэк прогресса.
+      // signal — AbortSignal для отмены.
+      async function transcodeAV1ToH264(file, onProgress, signal) {
+        if (!isAvailable()) {
+          throw new Error('Браузер не поддерживает WebCodecs API или библиотеки не загрузились.');
+        }
+
+        const mp4box = MP4Box.createFile();
+        let videoTrack = null;
+        let audioTrack = null;
+        let videoSamplesTotal = 0;
+        let audioSamplesTotal = 0;
+        let videoSamplesEncoded = 0;
+        let audioSamplesEnqueued = 0;
+        let videoSamplesEnqueued = 0;
+        let videoFlushDone = false;
+        let aborted = false;
+
+        let muxer = null;
+        let videoDecoder = null;
+        let videoEncoder = null;
+        let audioConfigDescription = null;
+
+        const abortFn = () => {
+          aborted = true;
+          try { videoDecoder && videoDecoder.close(); } catch (_) {}
+          try { videoEncoder && videoEncoder.close(); } catch (_) {}
+        };
+        if (signal) signal.addEventListener('abort', abortFn);
+
+        let resolveDone, rejectDone;
+        const done = new Promise((res, rej) => { resolveDone = res; rejectDone = rej; });
+
+        function reportProgress() {
+          const vTotal = Math.max(1, videoSamplesTotal);
+          const vp = videoSamplesEncoded / vTotal;
+          onProgress(Math.max(0, Math.min(0.99, vp)));
+        }
+
+        function maybeComplete() {
+          if (videoFlushDone &&
+              videoSamplesEncoded >= videoSamplesEnqueued &&
+              videoSamplesTotal > 0 &&
+              videoSamplesEncoded >= videoSamplesTotal) {
+            resolveDone();
+          }
+        }
+
+        // Бэкпрешер: ждём пока очередь декодера/энкодера не разгрузится.
+        async function waitForQueueSpace() {
+          while (videoDecoder && videoDecoder.decodeQueueSize > 24 && !aborted) {
+            await new Promise(r => setTimeout(r, 16));
+          }
+          while (videoEncoder && videoEncoder.encodeQueueSize > 16 && !aborted) {
+            await new Promise(r => setTimeout(r, 16));
+          }
+        }
+
+        mp4box.onError = (err) => rejectDone(new Error('MP4Box error: ' + err));
+
+        mp4box.onReady = (info) => {
+          videoTrack = info.videoTracks && info.videoTracks[0];
+          audioTrack = info.audioTracks && info.audioTracks[0];
+          if (!videoTrack) {
+            rejectDone(new Error('В файле нет видеодорожки'));
+            return;
+          }
+          videoSamplesTotal = videoTrack.nb_samples;
+          audioSamplesTotal = audioTrack ? audioTrack.nb_samples : 0;
+
+          const width = videoTrack.video.width;
+          const height = videoTrack.video.height;
+
+          // Целевой битрейт: ~3 бит/пиксель для 720p ≈ 2.8 Мбит/с;
+          // зажимаем в [1, 8] Мбит/с для безопасности на любых разрешениях.
+          const bitrate = Math.max(1_000_000, Math.min(8_000_000, Math.round(width * height * 3)));
+
+          // Извлекаем audio config заранее — он понадобится для каждого AAC чанка.
+          if (audioTrack) {
+            audioConfigDescription = extractAudioConfig(mp4box, audioTrack);
+          }
+
+          // Инициализируем muxer
+          try {
+            muxer = new Mp4Muxer.Muxer({
+              target: new Mp4Muxer.ArrayBufferTarget(),
+              video: { codec: 'avc', width, height },
+              audio: audioTrack ? {
+                codec: 'aac',
+                numberOfChannels: audioTrack.audio.channel_count,
+                sampleRate: audioTrack.audio.sample_rate,
+              } : undefined,
+              fastStart: 'in-memory',
+              firstTimestampBehavior: 'offset',
+            });
+          } catch (e) {
+            rejectDone(new Error('Mp4Muxer init failed: ' + (e.message || e)));
+            return;
+          }
+
+          // VideoDecoder: AV1 → VideoFrame
+          videoDecoder = new VideoDecoder({
+            output: (frame) => {
+              if (aborted) { frame.close(); return; }
+              try {
+                videoEncoder.encode(frame);
+              } catch (e) {
+                rejectDone(new Error('VideoEncoder.encode failed: ' + (e.message || e)));
+              }
+              frame.close();
+            },
+            error: (e) => rejectDone(new Error('VideoDecoder error: ' + (e.message || e))),
+          });
+          const decoderConfig = {
+            codec: videoTrack.codec,
+            codedWidth: width,
+            codedHeight: height,
+            description: extractDescription(mp4box, videoTrack),
+          };
+          videoDecoder.configure(decoderConfig);
+
+          // VideoEncoder: VideoFrame → H.264 chunks (Baseline 3.1, broadly compatible)
+          videoEncoder = new VideoEncoder({
+            output: (chunk, meta) => {
+              if (aborted || !muxer) return;
+              try {
+                muxer.addVideoChunk(chunk, meta);
+                videoSamplesEncoded++;
+                reportProgress();
+                maybeComplete();
+              } catch (e) {
+                rejectDone(new Error('Muxer.addVideoChunk failed: ' + (e.message || e)));
+              }
+            },
+            error: (e) => rejectDone(new Error('VideoEncoder error: ' + (e.message || e))),
+          });
+          videoEncoder.configure({
+            codec: 'avc1.42E01F',
+            width, height,
+            bitrate,
+            framerate: 30,
+            avc: { format: 'avc' }, // эмитить avcC (нужен для muxer)
+          });
+
+          // Извлекаем сэмплы обоих треков
+          mp4box.setExtractionOptions(videoTrack.id, null, { nbSamples: 100 });
+          if (audioTrack) {
+            mp4box.setExtractionOptions(audioTrack.id, null, { nbSamples: 100 });
+          }
+          mp4box.start();
+        };
+
+        mp4box.onSamples = (track_id, ref, samples) => {
+          if (aborted) return;
+
+          if (videoTrack && track_id === videoTrack.id) {
+            for (const s of samples) {
+              const chunk = new EncodedVideoChunk({
+                type: s.is_sync ? 'key' : 'delta',
+                timestamp: 1e6 * s.cts / s.timescale,
+                duration: 1e6 * s.duration / s.timescale,
+                data: s.data,
+              });
+              try {
+                videoDecoder.decode(chunk);
+                videoSamplesEnqueued++;
+              } catch (e) {
+                rejectDone(new Error('VideoDecoder.decode failed: ' + (e.message || e)));
+                return;
+              }
+            }
+          } else if (audioTrack && track_id === audioTrack.id && muxer && audioConfigDescription) {
+            // Аудио — пасстру AAC: пишем сэмплы напрямую в muxer без декодинга.
+            for (const s of samples) {
+              try {
+                muxer.addAudioChunkRaw(
+                  s.data instanceof Uint8Array ? s.data : new Uint8Array(s.data),
+                  'key',
+                  1e6 * s.cts / s.timescale,
+                  1e6 * s.duration / s.timescale,
+                  {
+                    decoderConfig: {
+                      codec: audioTrack.codec,
+                      sampleRate: audioTrack.audio.sample_rate,
+                      numberOfChannels: audioTrack.audio.channel_count,
+                      description: audioConfigDescription,
+                    },
+                  }
+                );
+                audioSamplesEnqueued++;
+              } catch (e) {
+                rejectDone(new Error('Muxer.addAudioChunkRaw failed: ' + (e.message || e)));
+                return;
+              }
+            }
+          }
+        };
+
+        // Кормим mp4box потоком из файла, периодически уступая поток
+        // чтобы декодер/энкодер успевали обрабатывать.
+        (async () => {
+          try {
+            const reader = file.stream().getReader();
+            let offset = 0;
+            while (!aborted) {
+              const { value, done: streamDone } = await reader.read();
+              if (streamDone) break;
+              const ab = value.buffer.slice(value.byteOffset, value.byteOffset + value.byteLength);
+              ab.fileStart = offset;
+              offset += value.byteLength;
+              mp4box.appendBuffer(ab);
+              await waitForQueueSpace();
+            }
+            if (aborted) return;
+            mp4box.flush();
+
+            // Дожидаемся когда все сэмплы окажутся в декодере
+            // (mp4box.flush заэмитит финальные onSamples синхронно).
+            await videoDecoder.flush();
+            await videoEncoder.flush();
+            videoFlushDone = true;
+            maybeComplete();
+          } catch (e) {
+            rejectDone(new Error('Pump/flush failed: ' + (e.message || e)));
+          }
+        })();
+
+        await done;
+
+        // Закрываем декодеры
+        try { videoDecoder.close(); } catch (_) {}
+        try { videoEncoder.close(); } catch (_) {}
+
+        if (signal) signal.removeEventListener('abort', abortFn);
+
+        // Финализируем muxer и оборачиваем в File
+        muxer.finalize();
+        const buffer = muxer.target.buffer;
+        onProgress(1.0);
+
+        const baseName = (file.name || 'input').replace(/\.[^.]+$/, '');
+        return new File([buffer], `${baseName}_h264.mp4`, { type: 'video/mp4' });
+      }
+
+      return { isAvailable, probeCodec, isAV1, transcodeAV1ToH264 };
     })();
 
     // ====================================================================
@@ -2577,6 +3014,24 @@
         if (f) handleFile(f);
       });
 
+      const codecBadgeEl = document.getElementById('codec-badge');
+
+      function renderCodecBadge(probe) {
+        if (!codecBadgeEl) return;
+        if (!probe || !probe.videoCodec) {
+          codecBadgeEl.classList.add('hidden');
+          return;
+        }
+        codecBadgeEl.classList.remove('hidden');
+        const av1 = Transcoder.isAV1(probe.videoCodec);
+        codecBadgeEl.classList.toggle('is-warn', av1);
+        if (av1) {
+          codecBadgeEl.innerHTML = `⚠️ Кодек видеотрека: <span class="codec-tag">${probe.videoCodec}</span> (AV1). FFmpeg.wasm не умеет его декодировать — при нажатии «Далее» браузер сам перекодирует видео в H.264 (~1× длительности ролика).`;
+        } else {
+          codecBadgeEl.innerHTML = `Кодек видеотрека: <span class="codec-tag">${probe.videoCodec}</span> (совместим с FFmpeg.wasm).`;
+        }
+      }
+
       function handleFile(file) {
         if (!file.type.startsWith('video/')) {
           UI.toast('Это не похоже на видео-файл', 'warn');
@@ -2585,6 +3040,8 @@
         // Освободим предыдущий URL если был
         if (AppState.inputUrl) URL.revokeObjectURL(AppState.inputUrl);
         AppState.inputFile = file;
+        AppState.inputCodecProbe = null;
+        if (codecBadgeEl) codecBadgeEl.classList.add('hidden');
         const url = URL.createObjectURL(file);
         AppState.inputUrl = url;
         previewVideo.src = url;
@@ -2599,6 +3056,14 @@
           renderMeta(meta, file);
           previewBlock.classList.remove('hidden');
           updateClipsCountWarning();
+          // Параллельно пробим кодек через MP4Box (фоновая задача — не блокирует UI).
+          // Если файл не MP4 (WebM/MOV/AVI) — probe вернёт null, считаем кодек неизвестным
+          // и пропускаем транскод (FFmpeg может справиться сам).
+          Transcoder.probeCodec(file).then((probe) => {
+            if (AppState.inputFile !== file) return; // сменили файл пока пробили
+            AppState.inputCodecProbe = probe;
+            renderCodecBadge(probe);
+          }).catch(() => { /* мягкий fail — не показываем бейдж */ });
         };
       }
 
@@ -2628,11 +3093,142 @@
         fileInput.value = '';
       });
 
+      // ====== Экран 1.5: Транскодирование AV1 → H.264 ======
+      // Этот экран и его обработчики прячут весь WebCodecs-pipeline. Показываются
+      // ТОЛЬКО при AV1 на входе. После успеха AppState.inputFile подменяется на
+      // новый File('input_h264.mp4'), все meta пересчитываются на основе
+      // нового blob URL, и дальше всё идёт через ffmpeg.wasm как обычно.
+      const transProgressEl = document.getElementById('trans-progress');
+      const transPctEl = document.getElementById('pct-trans');
+      const transMetaEl = document.getElementById('meta-trans');
+      const transSummaryEl = document.getElementById('trans-summary');
+      const phaseTransEl = document.getElementById('phase-trans');
+
+      function setTransProgress(p, label) {
+        const pct = Math.max(0, Math.min(100, Math.round(p * 100)));
+        if (transProgressEl) transProgressEl.style.width = pct + '%';
+        if (transPctEl) transPctEl.textContent = pct + '%';
+        if (label && transMetaEl) transMetaEl.textContent = label;
+      }
+
+      async function maybeTranscodeThenSettings() {
+        if (!AppState.inputFile) return;
+
+        const probe = AppState.inputCodecProbe;
+        const needTranscode = probe && Transcoder.isAV1(probe.videoCodec);
+
+        if (!needTranscode) {
+          UI.show('settings');
+          renderTimeline();
+          updateClipsCountWarning();
+          return;
+        }
+
+        // Проверяем доступность WebCodecs API в текущем браузере
+        if (!Transcoder.isAvailable()) {
+          UI.toast('Браузер не поддерживает WebCodecs API. Перекодируйте AV1 → H.264 локально перед загрузкой.', 'warn');
+          UI.show('settings');
+          renderTimeline();
+          updateClipsCountWarning();
+          return;
+        }
+
+        // Дополнительно проверяем что AV1-decoder реально работает в этом браузере
+        try {
+          const support = await VideoDecoder.isConfigSupported({
+            codec: probe.videoCodec,
+            codedWidth: probe.width || 1280,
+            codedHeight: probe.height || 720,
+          });
+          if (!support || !support.supported) {
+            UI.toast(`Браузер не умеет декодировать ${probe.videoCodec}. Перекодируйте видео в H.264 локально.`, 'warn');
+            UI.show('settings');
+            renderTimeline();
+            updateClipsCountWarning();
+            return;
+          }
+        } catch (e) {
+          UI.toast('Не удалось проверить поддержку AV1: ' + (e.message || e), 'warn');
+          UI.show('settings');
+          renderTimeline();
+          updateClipsCountWarning();
+          return;
+        }
+
+        // Запускаем транскод
+        UI.show('transcoding');
+        setTransProgress(0, 'Подготовка демуксера…');
+        if (phaseTransEl) phaseTransEl.classList.add('is-active');
+
+        const abort = new AbortController();
+        AppState.transcodeAbort = abort;
+        const t0 = performance.now();
+
+        try {
+          const newFile = await Transcoder.transcodeAV1ToH264(
+            AppState.inputFile,
+            (p) => {
+              const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+              const eta = p > 0.02 ? `, осталось ~${Math.max(0, ((1 - p) * (performance.now() - t0) / p / 1000)).toFixed(0)}s` : '';
+              setTransProgress(p, `${(p * 100).toFixed(1)}% · ${elapsed}s${eta}`);
+            },
+            abort.signal,
+          );
+          AppState.transcodeAbort = null;
+
+          // Подменяем входной файл и обновляем превью + метаданные
+          if (AppState.inputUrl) URL.revokeObjectURL(AppState.inputUrl);
+          AppState.inputFile = newFile;
+          const newUrl = URL.createObjectURL(newFile);
+          AppState.inputUrl = newUrl;
+          previewVideo.src = newUrl;
+          AppState.inputCodecProbe = null;
+          if (codecBadgeEl) codecBadgeEl.classList.add('hidden');
+
+          await new Promise((res) => {
+            previewVideo.onloadedmetadata = () => {
+              const meta = {
+                duration: previewVideo.duration,
+                width: previewVideo.videoWidth,
+                height: previewVideo.videoHeight,
+                size: newFile.size,
+              };
+              AppState.inputMeta = meta;
+              renderMeta(meta, newFile);
+              res();
+            };
+          });
+
+          if (phaseTransEl) {
+            phaseTransEl.classList.remove('is-active');
+            phaseTransEl.classList.add('is-done');
+          }
+          UI.toast(`AV1 → H.264 транскод готов: ${(newFile.size / 1024 / 1024).toFixed(1)} MB`, 'ok');
+
+          UI.show('settings');
+          renderTimeline();
+          updateClipsCountWarning();
+        } catch (e) {
+          AppState.transcodeAbort = null;
+          if (phaseTransEl) phaseTransEl.classList.remove('is-active');
+          if (e && e.name === 'AbortError') {
+            UI.toast('Транскод отменён', 'warn');
+          } else {
+            UI.toast('Ошибка транскода: ' + (e && e.message ? e.message : String(e)), 'error');
+          }
+          UI.show('upload');
+        }
+      }
+
       document.getElementById('btn-go-settings').addEventListener('click', () => {
         if (!AppState.inputFile) return;
-        UI.show('settings');
-        renderTimeline();
-        updateClipsCountWarning();
+        maybeTranscodeThenSettings();
+      });
+
+      document.getElementById('btn-cancel-trans').addEventListener('click', () => {
+        if (AppState.transcodeAbort) {
+          AppState.transcodeAbort.abort();
+        }
       });
 
       // ====== Экран 2: Настройки ======
