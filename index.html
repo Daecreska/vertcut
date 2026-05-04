@@ -2061,15 +2061,20 @@
         let videoEncoder = null;
         let audioConfigDescription = null;
 
-        const abortFn = () => {
-          aborted = true;
-          try { videoDecoder && videoDecoder.close(); } catch (_) {}
-          try { videoEncoder && videoEncoder.close(); } catch (_) {}
-        };
-        if (signal) signal.addEventListener('abort', abortFn);
-
         let resolveDone, rejectDone;
         const done = new Promise((res, rej) => { resolveDone = res; rejectDone = rej; });
+
+        const abortFn = () => {
+          aborted = true;
+          // Закрываем декодеры до reject — иначе они продолжат пытаться выдать output
+          // и могут залогировать ошибки в консоль уже после отмены.
+          try { videoDecoder && videoDecoder.close(); } catch (_) {}
+          try { videoEncoder && videoEncoder.close(); } catch (_) {}
+          const err = new Error('aborted');
+          err.name = 'AbortError';
+          rejectDone(err);
+        };
+        if (signal) signal.addEventListener('abort', abortFn);
 
         function reportProgress() {
           const vTotal = Math.max(1, videoSamplesTotal);
@@ -2078,10 +2083,11 @@
         }
 
         function maybeComplete() {
-          if (videoFlushDone &&
-              videoSamplesEncoded >= videoSamplesEnqueued &&
-              videoSamplesTotal > 0 &&
-              videoSamplesEncoded >= videoSamplesTotal) {
+          // После того как pump+декодер+энкодер flush'нулись, ВСЕ enqueued сэмплы
+          // дали output чанки. Не сравниваем с videoSamplesTotal (nb_samples от
+          // MP4Box иногда отличается на 1-2 от реальной количества выданных
+          // onSamples сэмплов — в этом случае ждать «недостающего» сэмпла бессмысленно).
+          if (videoFlushDone && videoSamplesEncoded >= videoSamplesEnqueued && videoSamplesEnqueued > 0) {
             resolveDone();
           }
         }
@@ -2116,11 +2122,17 @@
           const bitrate = Math.max(1_000_000, Math.min(8_000_000, Math.round(width * height * 3)));
 
           // Извлекаем audio config заранее — он понадобится для каждого AAC чанка.
+          // Если кодек не AAC или esds-бокс отсутствует/не парсится — пасстру невозможен,
+          // в этом случае пропускаем аудио целиком (видео без звука лучше, чем падение транскода).
           if (audioTrack) {
             audioConfigDescription = extractAudioConfig(mp4box, audioTrack);
+            if (!audioConfigDescription) {
+              audioTrack = null;
+              audioSamplesTotal = 0;
+            }
           }
 
-          // Инициализируем muxer
+          // Инициализируем muxer (без audio-секции, если пасстру невозможен)
           try {
             muxer = new Mp4Muxer.Muxer({
               target: new Mp4Muxer.ArrayBufferTarget(),
@@ -2254,6 +2266,13 @@
             if (aborted) return;
             mp4box.flush();
 
+            // Если mp4box не вызвал onReady (битый/не-MP4 контейнер), декодеры так и
+            // остались null — явно говорим, что не удалось разобрать файл.
+            if (!videoDecoder || !videoEncoder) {
+              rejectDone(new Error('MP4Box не смог разобрать файл (нет moov-бокса или нет AV1-видеотрека)'));
+              return;
+            }
+
             // Дожидаемся когда все сэмплы окажутся в декодере
             // (mp4box.flush заэмитит финальные onSamples синхронно).
             await videoDecoder.flush();
@@ -2261,7 +2280,9 @@
             videoFlushDone = true;
             maybeComplete();
           } catch (e) {
-            rejectDone(new Error('Pump/flush failed: ' + (e.message || e)));
+            if (!aborted) {
+              rejectDone(new Error('Pump/flush failed: ' + (e.message || e)));
+            }
           }
         })();
 
@@ -3176,17 +3197,18 @@
           );
           AppState.transcodeAbort = null;
 
-          // Подменяем входной файл и обновляем превью + метаданные
+          // Подменяем входной файл и обновляем превью + метаданные.
+          // ВАЖНО: handler ставим ДО установки src, чтобы не пропустить
+          // событие, если браузер выдаёт loadedmetadata синхронно из кеша.
           if (AppState.inputUrl) URL.revokeObjectURL(AppState.inputUrl);
           AppState.inputFile = newFile;
-          const newUrl = URL.createObjectURL(newFile);
-          AppState.inputUrl = newUrl;
-          previewVideo.src = newUrl;
           AppState.inputCodecProbe = null;
           if (codecBadgeEl) codecBadgeEl.classList.add('hidden');
 
-          await new Promise((res) => {
+          await new Promise((res, rej) => {
+            const tid = setTimeout(() => rej(new Error('Не удалось прочитать метаданные транскодированного файла за 15 секунд')), 15000);
             previewVideo.onloadedmetadata = () => {
+              clearTimeout(tid);
               const meta = {
                 duration: previewVideo.duration,
                 width: previewVideo.videoWidth,
@@ -3197,7 +3219,15 @@
               renderMeta(meta, newFile);
               res();
             };
+            previewVideo.onerror = () => {
+              clearTimeout(tid);
+              rej(new Error('Видео-элемент не смог загрузить транскодированный MP4 (возможно, испорчен muxer-вывод)'));
+            };
+            const newUrl = URL.createObjectURL(newFile);
+            AppState.inputUrl = newUrl;
+            previewVideo.src = newUrl;
           });
+          previewVideo.onerror = null;
 
           if (phaseTransEl) {
             phaseTransEl.classList.remove('is-active');
