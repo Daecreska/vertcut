@@ -1963,6 +1963,77 @@
         return out;
       }
 
+      // Нарезка одного клипа с авто-фоллбэком на точный seek.
+      // Сначала пробуем «-ss до -i» (быстрый keyframe-seek), затем «copy».
+      // Если получили 0-байтовый файл (что бывает на видео с битой timeline
+      // или GOP > duration), пробуем «-ss после -i» с реэнкодом — медленнее,
+      // но всегда даёт валидный кусок.
+      async function cutClipWithFallback({ inputName, clipName, start, dur, aspect }) {
+        async function tryRun(args, label) {
+          try {
+            await FFmpegCore.run(args);
+          } catch (e) {
+            const tail = FFmpegCore.lastLogLines ? FFmpegCore.lastLogLines(8) : '';
+            const msg = e && e.message ? e.message : String(e);
+            throw new Error(`${label}: ${msg}${tail ? ' — ' + tail : ''}`);
+          }
+          try {
+            const data = await FFmpegCore.readFile(clipName);
+            return data && data.byteLength > 0 ? data : null;
+          } catch (_) {
+            return null;
+          }
+        }
+
+        // Стратегия 1: быстрый seek + reencode (для 9:16) или copy (для 16:9)
+        const fastArgs = aspect === '9:16'
+          ? [
+              '-ss', String(start), '-i', inputName, '-t', String(dur),
+              '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+              clipName,
+            ]
+          : [
+              '-ss', String(start), '-i', inputName, '-t', String(dur),
+              '-c:v', 'copy', '-c:a', 'copy', '-movflags', '+faststart',
+              clipName,
+            ];
+        let data = null;
+        try {
+          data = await tryRun(fastArgs, 'fast-seek');
+        } catch (e) {
+          // 16:9 копирование может упасть на keyframe-границах — фоллбэк ниже.
+          if (aspect !== '16:9') throw e;
+        }
+        if (data) return data;
+        await FFmpegCore.unlink(clipName);
+
+        // Стратегия 2: точный seek (после -i) + reencode для обоих aspect
+        const accurateArgs = aspect === '9:16'
+          ? [
+              '-i', inputName, '-ss', String(start), '-t', String(dur),
+              '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+              clipName,
+            ]
+          : [
+              '-i', inputName, '-ss', String(start), '-t', String(dur),
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
+              clipName,
+            ];
+        data = await tryRun(accurateArgs, 'accurate-seek');
+        if (data) return data;
+        await FFmpegCore.unlink(clipName);
+
+        const tail = FFmpegCore.lastLogLines ? FFmpegCore.lastLogLines(8) : '';
+        throw new Error(
+          `FFmpeg создал пустой файл (оба варианта seek). Входное видео может быть повреждено или несовместимо с FFmpeg.wasm.${tail ? ' Лог: ' + tail : ''}`
+        );
+      }
+
       // Главный пайплайн обработки
       async function process(ctx) {
         const { file, settings, plan, onPhase, onTotal } = ctx;
@@ -1992,46 +2063,10 @@
 
           // ---------- Нарезка ----------
           try {
-            const baseArgs = ['-ss', String(seg.start), '-i', inputName, '-t', String(dur)];
-            const args = settings.aspect === '9:16'
-              ? [
-                  ...baseArgs,
-                  '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
-                  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-                  '-c:a', 'aac', '-b:a', '128k',
-                  '-movflags', '+faststart',
-                  clipName,
-                ]
-              : [
-                  ...baseArgs,
-                  '-c:v', 'copy', '-c:a', 'copy',
-                  '-movflags', '+faststart',
-                  clipName,
-                ];
-            try {
-              await FFmpegCore.run(args);
-            } catch (errCopy) {
-              // фоллбэк на перекодирование 16:9
-              if (settings.aspect === '16:9') {
-                await FFmpegCore.run([
-                  ...baseArgs,
-                  '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-                  '-c:a', 'aac', '-b:a', '128k',
-                  '-movflags', '+faststart',
-                  clipName,
-                ]);
-              } else {
-                throw errCopy;
-              }
-            }
-
-            const clipData = await FFmpegCore.readFile(clipName);
-            // Защита от пустого вывода: если FFmpeg по какой-то причине
-            // отработал без ошибки, но не записал ни одного байта,
-            // покажем явную ошибку вместо «битой» карточки на 0 B.
-            if (!clipData || clipData.byteLength === 0) {
-              throw new Error('FFmpeg создал пустой файл. Проверьте, что входное видео не повреждено.');
-            }
+            const clipData = await cutClipWithFallback({
+              inputName, clipName, start: seg.start, dur,
+              aspect: settings.aspect,
+            });
             const clipBlob = new Blob([clipData.buffer], { type: 'video/mp4' });
             const clipUrl = URL.createObjectURL(clipBlob);
             AppState.blobUrls.add(clipUrl);
@@ -2235,7 +2270,7 @@
         return clip;
       }
 
-      return { calcPlan, process, rerenderWithSubs, fmtTime };
+      return { calcPlan, process, rerenderWithSubs, fmtTime, cutClipWithFallback };
     })();
 
     // ====================================================================
@@ -2965,35 +3000,25 @@
         const i = AppState.clips.findIndex((c) => c.index === clip.index);
         if (i < 0) return;
         const seg = { start: clip.start, end: clip.end };
+        let inputName = null;
+        const clipName = `retry_${clip.index}.mp4`;
         try {
           // Запишем input заново
           const buf = new Uint8Array(await AppState.inputFile.arrayBuffer());
-          const inputName = 'reinput.' + (AppState.inputFile.name.split('.').pop() || 'mp4');
+          inputName = 'reinput.' + (AppState.inputFile.name.split('.').pop() || 'mp4');
           await FFmpegCore.writeFile(inputName, buf);
           const dur = seg.end - seg.start;
-          const clipName = `retry_${clip.index}.mp4`;
-          if (AppState.settings.aspect === '9:16') {
-            await FFmpegCore.run([
-              '-ss', String(seg.start), '-i', inputName, '-t', String(dur),
-              '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
-              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
-              clipName,
-            ]);
-          } else {
-            await FFmpegCore.run([
-              '-ss', String(seg.start), '-i', inputName, '-t', String(dur),
-              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-              '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
-              clipName,
-            ]);
-          }
-          const data = await FFmpegCore.readFile(clipName);
+          // Используем общий путь с авто-фоллбэком и 0-байт guard
+          const data = await VideoProcessor.cutClipWithFallback({
+            inputName, clipName, start: seg.start, dur,
+            aspect: AppState.settings.aspect,
+          });
           const blob = new Blob([data.buffer], { type: 'video/mp4' });
+          if (blob.size === 0) {
+            throw new Error('FFmpeg вернул пустой файл при повторной попытке.');
+          }
           const url = URL.createObjectURL(blob);
           AppState.blobUrls.add(url);
-          await FFmpegCore.unlink(clipName);
-          await FFmpegCore.unlink(inputName);
           AppState.clips[i] = {
             index: clip.index, start: seg.start, end: seg.end, size: blob.size,
             originalUrl: url, originalBlob: blob, withSubsUrl: null,
@@ -3002,7 +3027,13 @@
           GalleryManager.render(AppState.clips);
           UI.toast('Готово', 'ok');
         } catch (e) {
-          UI.toast('Не получилось: ' + e.message, 'err', 6000);
+          console.error('Retry failed', e);
+          UI.toast('Не получилось: ' + (e.message || String(e)), 'err', 6000);
+        } finally {
+          try { await FFmpegCore.unlink(clipName); } catch (_) {}
+          if (inputName) {
+            try { await FFmpegCore.unlink(inputName); } catch (_) {}
+          }
         }
       });
 
