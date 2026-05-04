@@ -2735,7 +2735,13 @@
     // UIController — экраны, тосты, прогресс
     // ====================================================================
     const UI = (() => {
-      const screens = ['upload', 'settings', 'processing', 'results'];
+      // Все экраны, между которыми переключаемся (включая промежуточный
+      // 'transcoding' для AV1→H.264 конвертации). Без него UI.show('transcoding')
+      // не активировал секцию и юзер видел пустой экран на время транскода.
+      const screens = ['upload', 'transcoding', 'settings', 'processing', 'results'];
+      // Степпер показывает только основные шаги — 'transcoding' промежуточный,
+      // привязываем его к шагу 'upload', чтобы не сдвигать кружки степпера.
+      const stepperScreens = ['upload', 'settings', 'processing', 'results'];
 
       function show(name) {
         for (const sc of screens) {
@@ -2750,8 +2756,9 @@
             el.classList.remove('is-active');
           }
         }
-        // Степпер
-        const stepIdx = screens.indexOf(name);
+        // Степпер: 'transcoding' приравниваем к 'upload' (промежуточный шаг).
+        const stepperKey = name === 'transcoding' ? 'upload' : name;
+        const stepIdx = stepperScreens.indexOf(stepperKey);
         document.querySelectorAll('#stepper .dot').forEach((d, i) => {
           d.classList.toggle('active', i === stepIdx);
           d.classList.toggle('done', i < stepIdx);
