@@ -936,7 +936,7 @@
         <div style="margin-top:18px;">
           <div class="phase" id="phase-trans">
             <div class="phase-num">⚡</div>
-            <div class="phase-name"><div>Декодирование AV1 + Энкодинг H.264 (avc1.42E01F)</div><div class="meta" id="meta-trans">…</div></div>
+            <div class="phase-name"><div>Декодирование AV1 + Энкодинг H.264 (avc1.6400xx)</div><div class="meta" id="meta-trans">…</div></div>
             <div class="phase-pct mono" id="pct-trans">0%</div>
           </div>
         </div>
@@ -2118,8 +2118,30 @@
           const height = videoTrack.video.height;
 
           // Целевой битрейт: ~3 бит/пиксель для 720p ≈ 2.8 Мбит/с;
-          // зажимаем в [1, 8] Мбит/с для безопасности на любых разрешениях.
-          const bitrate = Math.max(1_000_000, Math.min(8_000_000, Math.round(width * height * 3)));
+          // зажимаем в [1, 16] Мбит/с для безопасности на любых разрешениях.
+          // 16 Мбит верхний потолок чтобы 4K не вылазил за разумное в браузере.
+          const bitrate = Math.max(1_000_000, Math.min(16_000_000, Math.round(width * height * 3)));
+
+          // Выбираем H.264 уровень динамически по разрешению — иначе
+          // VideoEncoder ругается "coded area exceeds maximum supported by AVC level".
+          // Macroblocks = ceil(W/16)*ceil(H/16). Максимумы из таблицы A-1 H.264.
+          // Используем avc1.640XX (High Profile) — он лучше сжимает и
+          // поддерживается всеми современными плеерами; для уровня 3.1 это
+          // эквивалент broadly compatible avc1.42E01F + лучше bitrate efficiency.
+          const mbs = Math.ceil(width / 16) * Math.ceil(height / 16);
+          let levelHex;
+          if (mbs <= 396)        levelHex = '1F'; // 3.1: 720p (CIF×4)
+          else if (mbs <= 792)   levelHex = '1F'; // 3.1: до 720x576
+          else if (mbs <= 1620)  levelHex = '1F'; // 3.1: до 1280x720
+          else if (mbs <= 3600)  levelHex = '28'; // 4.0: до 1920x1080 (8160 mbs/s — 30 fps)
+          else if (mbs <= 5120)  levelHex = '29'; // 4.1: до 1920x1080@high-fps
+          else if (mbs <= 8192)  levelHex = '2A'; // 4.2: до ~2K
+          else if (mbs <= 22080) levelHex = '32'; // 5.0: 1440p / 4K30
+          else if (mbs <= 36864) levelHex = '33'; // 5.1: 4K60
+          else                   levelHex = '34'; // 5.2: 8K
+          // avc1.640XX = High profile + level XX (XX в hex как level_idc).
+          // 0x00 (constraint set) — без ограничений.
+          const codecString = 'avc1.6400' + levelHex;
 
           // Извлекаем audio config заранее — он понадобится для каждого AAC чанка.
           // Если кодек не AAC или esds-бокс отсутствует/не парсится — пасстру невозможен,
@@ -2171,7 +2193,8 @@
           };
           videoDecoder.configure(decoderConfig);
 
-          // VideoEncoder: VideoFrame → H.264 chunks (Baseline 3.1, broadly compatible)
+          // VideoEncoder: VideoFrame → H.264 chunks. Уровень профиля выбран
+          // динамически выше (codecString) — Baseline 3.1 не хватает на 1080p+.
           videoEncoder = new VideoEncoder({
             output: (chunk, meta) => {
               if (aborted || !muxer) return;
@@ -2187,7 +2210,7 @@
             error: (e) => rejectDone(new Error('VideoEncoder error: ' + (e.message || e))),
           });
           videoEncoder.configure({
-            codec: 'avc1.42E01F',
+            codec: codecString,
             width, height,
             bitrate,
             framerate: 30,
