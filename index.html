@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r15">
+<body data-build="vertcut-muxfix-2026-06-05-r16">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r15 · clip-recover</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r16 · hotfix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -3664,7 +3664,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r15 · clip-recover', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r16 · hotfix', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3832,6 +3832,8 @@
         // catch, ранний return на error/no-codec). Без finally ошибка в
         // remux или transcodeAV1ToH264 навсегда заблокировала бы кнопку.
         try {
+        const probe = AppState.inputCodecProbe;
+        const needTranscode = probe && Transcoder.isAV1(probe.videoCodec);
 
         if (!needTranscode) {
           UI.show('settings');
