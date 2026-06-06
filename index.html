@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r16">
+<body data-build="vertcut-muxfix-2026-06-05-r17">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r16 · hotfix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r17 · short-vid</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -973,6 +973,11 @@
         <div class="panel">
           <h3 class="panel-title">Длина клипа</h3>
           <div class="pill-row" id="pill-length">
+            <!-- r17: добавили 5 и 10 сек — иначе короткие видео (<15s)
+                 блокировались videoTooShort без возможности выбрать
+                 подходящую длину. По умолчанию 30s остаётся активной. -->
+            <div class="pill" data-v="5">5 <span class="sub">сек</span></div>
+            <div class="pill" data-v="10">10 <span class="sub">сек</span></div>
             <div class="pill" data-v="15">15 <span class="sub">сек</span></div>
             <div class="pill is-active" data-v="30">30 <span class="sub">сек</span></div>
             <div class="pill" data-v="45">45 <span class="sub">сек</span></div>
@@ -3664,7 +3669,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r16 · hotfix', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r17 · short-vid', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3750,6 +3755,25 @@
           AppState.inputMeta = meta;
           renderMeta(meta, file);
           previewBlock.classList.remove('hidden');
+          // r17: auto-pick clipLength если видео короче текущей выбранной
+          // длины. Без этого короткие видео (<15s) блокировались
+          // videoTooShort без возможности выбрать подходящую опцию
+          // (минимум раньше был 15s). Теперь берём наименьшую pill-опцию
+          // ≤ dur, а если все опции больше dur — оставляем текущую
+          // (updateClipsCountWarning покажет баннер и заблокирует «Далее»).
+          const availableLens = [5, 10, 15, 30, 45, 60];
+          const currentLen = AppState.settings.clipLength;
+          if (meta.duration > 0 && meta.duration < currentLen) {
+            const fit = availableLens.filter((l) => l <= meta.duration);
+            if (fit.length > 0) {
+              const newLen = fit[fit.length - 1]; // наибольшая ≤ dur из доступных
+              AppState.settings.clipLength = newLen;
+              // Подсветим соответствующую pill
+              const pills = document.querySelectorAll('#pill-length .pill');
+              pills.forEach((p) => p.classList.toggle('is-active', +p.dataset.v === newLen));
+              console.log('[vertcut] auto-pick clipLength:', currentLen, '→', newLen, '(video', meta.duration.toFixed(1) + 's)');
+            }
+          }
           updateClipsCountWarning();
           // Параллельно пробим кодек через MP4Box (фоновая задача — не блокирует UI).
           // r12: MP4Box парсит только ISO BMFF (MP4/MOV). Для WebM/MKV
@@ -4310,7 +4334,11 @@
         const videoTooShort = dur > 0 && dur < len;
         if (videoTooShort) {
           banner.classList.add('is-visible');
-          banner.textContent = `Видео короче длины одного клипа (${dur.toFixed(1)}s < ${len}s). Уменьшите длину клипа до ≤${Math.floor(dur)}s или загрузите более длинный ролик.`;
+          // r17: auto-pick в handleFile() уже должен был подобрать
+          // наименьшую pill ≤ dur. Сюда попадаем только если видео
+          // короче МИНИМАЛЬНОЙ опции (5s) — это уже совсем короткие
+          // ролики. Показываем максимально понятное сообщение.
+          banner.textContent = `Видео короче минимальной длины клипа (${dur.toFixed(1)}s < ${len}s, минимум 5s). Загрузите ролик длиной хотя бы 5s.`;
           // r12: блокируем переход в настройки — там нечего делать без
           // хотя бы одного полного клипа. Defense-in-depth: и в хендлере
           // проверяем isTooShortVideo(), но disabled + tooltip — UX-чище.
