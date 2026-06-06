@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r18">
+<body data-build="vertcut-muxfix-2026-06-05-r19">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r18 · subs-fix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r19 · mime-fallback</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -3722,7 +3722,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r18 · subs-fix', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r19 · mime-fallback', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3792,7 +3792,14 @@
       // probe-1 ещё бежал.
       let loadSeq = 0;
       function handleFile(file) {
-        if (!file.type.startsWith('video/')) {
+        // r19: не все браузеры/ОС корректно ставят MIME для видео.
+        // .webm, .mkv, .avi часто приходят с file.type === '' —
+        // раньше toast "Это не похоже на видео" и reject. Фоллбэк
+        // на расширение файла если MIME не определился.
+        const ext = (file.name.split('.').pop() || '').toLowerCase();
+        const VIDEO_EXTS = ['mp4', 'webm', 'mkv', 'mov', 'avi', 'm4v', 'qt', 'mpe', 'mpeg', 'mpg', 'ogv', '3gp'];
+        const looksLikeVideo = file.type.startsWith('video/') || VIDEO_EXTS.includes(ext);
+        if (!looksLikeVideo) {
           UI.toast('Это не похоже на видео-файл', 'warn');
           return;
         }
