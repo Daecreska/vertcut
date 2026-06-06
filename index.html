@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r19">
+<body data-build="vertcut-muxfix-2026-06-05-r20">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r19 · mime-fallback</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r20 · dnd-fix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -3722,7 +3722,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r19 · mime-fallback', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r20 · dnd-fix', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3741,24 +3741,52 @@
       // Старт с экрана загрузки
       UI.show('upload');
 
-      // ====== Экран 1: Загрузка ======
+      // ====== Экран 1: Загрузка =====
       const dz = document.getElementById('dropzone');
       const fileInput = document.getElementById('file-input');
       const previewBlock = document.getElementById('preview-block');
       const previewVideo = document.getElementById('preview-video');
       const metaList = document.getElementById('meta-list');
 
-      ['dragenter', 'dragover'].forEach((ev) => {
-        dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('is-dragover'); });
-      });
-      ['dragleave', 'drop'].forEach((ev) => {
-        dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.remove('is-dragover'); });
-      });
-      dz.addEventListener('drop', (e) => {
+      // r20: DnD на dropzone был хрупким — dropzone-обёртка с вложенным
+      // file-input в Chrome/Edge плохо дружат с drag/drop (input
+      // перехватывает, label не получает drop-event). Делаем паттерн
+      // надёжным: window-level preventDefault + drop на весь
+      // screen-upload + drop на самом dropzone как fallback. Также
+      // window-level dragover нужен чтобы курсор "разрешал" drop ВЕЗДЕ
+      // на странице, не только над dropzone (иначе ОС показывает
+      // "нельзя сюда" курсор).
+      const screenUpload = document.getElementById('screen-upload');
+      // Drop-обработчик общий для dz и screen-upload. Не preventDefault
+      // здесь — это делает вызывающий код, чтобы is-dragover снимался.
+      const onDrop = (e) => {
         e.preventDefault();
-        const f = e.dataTransfer?.files?.[0];
+        e.stopPropagation();
+        if (dz) dz.classList.remove('is-dragover');
+        const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
         if (f) handleFile(f);
+      };
+      // r20: window-level preventDefault — ОБЯЗАТЕЛЬНО для drop на input[type=file].
+      // Без этого браузер открывает файл в текущей вкладке при drop.
+      ['dragover', 'drop'].forEach((ev) => {
+        window.addEventListener(ev, (e) => e.preventDefault());
       });
+      // Подсветка dropzone при наведении файла
+      ['dragenter', 'dragover'].forEach((ev) => {
+        if (dz) dz.addEventListener(ev, (e) => { e.preventDefault(); dz.classList.add('is-dragover'); });
+        if (screenUpload) screenUpload.addEventListener(ev, (e) => { if (dz) dz.classList.add('is-dragover'); });
+      });
+      ['dragleave'].forEach((ev) => {
+        if (dz) dz.addEventListener(ev, () => dz.classList.remove('is-dragover'));
+        if (screenUpload) screenUpload.addEventListener(ev, (e) => {
+          // relatedTarget = null когда курсор покинул окно
+          if (!e.relatedTarget) dz.classList.remove('is-dragover');
+        });
+      });
+      // Drop на dropzone и на screen-upload
+      if (dz) dz.addEventListener('drop', onDrop);
+      if (screenUpload) screenUpload.addEventListener('drop', onDrop);
+
       fileInput.addEventListener('change', (e) => {
         const f = e.target.files?.[0];
         if (f) handleFile(f);
