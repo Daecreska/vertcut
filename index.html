@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r20">
+<body data-build="vertcut-muxfix-2026-06-05-r21">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r20 · dnd-fix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r21 · src-restore</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -3722,7 +3722,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r20 · dnd-fix', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r21 · src-restore', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3842,6 +3842,11 @@
         if (codecBadgeEl) codecBadgeEl.classList.add('hidden');
         const url = URL.createObjectURL(file);
         AppState.inputUrl = url;
+        // r21: r20 DnD-рефакторинг случайно потерял эту строку. Без
+        // неё <video> не получает src, onloadedmetadata никогда не
+        // стреляет, превью не показывается, кнопка «Далее» остаётся
+        // заблокированной (videoTooShort ловит dur=0). Возвращаем.
+        previewVideo.src = url;
         previewVideo.onloadedmetadata = () => {
           if (mySeq !== loadSeq) return; // r18: stale callback, файл уже сменили
           const meta = {
