@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r12">
+<body data-build="vertcut-muxfix-2026-06-05-r13">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r12 · auditfix2</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r13 · sabfix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1715,10 +1715,16 @@
       }
       async function readFile(name) {
         if (!ffmpeg) throw new Error('FFmpeg не инициализирован');
-        // Копируем из эмскриптеновского heap'а (это может быть SharedArrayBuffer
-        // из-за pthread): `new Uint8Array(view)` отдаёт уже обычный ArrayBuffer,
-        // совместимый с Blob() и postMessage без особых правил.
-        return new Uint8Array(ffmpeg.FS('readFile', name));
+        // r13: ВАЖНО — копируем в СВЕЖИЙ ArrayBuffer через .slice().
+        // Без этого emscripten возвращает Uint8Array-view поверх
+        // SharedArrayBuffer-куска heap'а (pthread-сборка ffmpeg.wasm 0.11.6
+        // использует SAB для межпоточной коммуникации). Тогда у такого view
+        // .buffer указывает на ВЕСЬ heap (мегабайты), а не на наши данные.
+        // Если бы вызывающий делал new Blob([view.buffer]) — Blob получил бы
+        // чушь из heap'а. .slice() создаёт новый TypedArray с обычным
+        // (не-shared) ArrayBuffer точно нужного размера — безопасно для
+        // Blob/File/StreamResponse.
+        return ffmpeg.FS('readFile', name).slice();
       }
       async function unlink(name) {
         if (!ffmpeg) return;
@@ -3109,7 +3115,7 @@
               inputName, clipName, start: seg.start, dur,
               aspect: settings.aspect,
             });
-            const clipBlob = new Blob([clipData.buffer], { type: 'video/mp4' });
+            const clipBlob = new Blob([clipData], { type: 'video/mp4' });
             const clipUrl = URL.createObjectURL(clipBlob);
             AppState.blobUrls.add(clipUrl);
 
@@ -3222,7 +3228,7 @@
                     if (!finalData || finalData.byteLength === 0) {
                       throw new Error('FFmpeg вернул пустой файл при вжигании субтитров (libass не отрендерил SRT).');
                     }
-                    const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
+                    const finalBlob = new Blob([finalData], { type: 'video/mp4' });
                     const finalUrl = URL.createObjectURL(finalBlob);
                     AppState.blobUrls.add(finalUrl);
                     clipResult.withSubsBlob = finalBlob;
@@ -3289,7 +3295,7 @@
         if (!finalData || finalData.byteLength === 0) {
           throw new Error('FFmpeg вернул пустой файл при перерендере субтитров.');
         }
-        const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
+        const finalBlob = new Blob([finalData], { type: 'video/mp4' });
         const finalUrl = URL.createObjectURL(finalBlob);
         AppState.blobUrls.add(finalUrl);
         // Чистим
@@ -3655,7 +3661,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r12 · auditfix2', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r13 · sabfix', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3918,7 +3924,7 @@
             try { await FFmpegCore.unlink(outputName); } catch (_) {}
             // Подменяем файл: новый File c тем же baseName + '_remuxed.mp4'
             const baseName = (AppState.inputFile.name || 'input').replace(/\.[^.]+$/, '');
-            transcodingFile = new File([remuxed.buffer], `${baseName}_remuxed.mp4`, { type: 'video/mp4' });
+            transcodingFile = new File([remuxed], `${baseName}_remuxed.mp4`, { type: 'video/mp4' });
             // r12: НЕ ставим transcodingFile в AppState.inputFile (это сделает
             // success-handler ниже), но обновим codec probe на новый файл
             // (он тоже MP4, MP4Box справится).
@@ -4632,7 +4638,7 @@
             inputName, clipName, start: seg.start, dur,
             aspect: AppState.settings.aspect,
           });
-          const blob = new Blob([data.buffer], { type: 'video/mp4' });
+          const blob = new Blob([data], { type: 'video/mp4' });
           if (blob.size === 0) {
             throw new Error('FFmpeg вернул пустой файл при повторной попытке.');
           }
