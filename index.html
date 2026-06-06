@@ -167,7 +167,7 @@
     .stepper .dot {
       width: 8px; height: 8px; border-radius: 50%;
       background: rgba(255,255,255,0.12);
-      transition: all 0.25s ease;
+      transition: background 0.25s ease, transform 0.25s ease;
     }
     .stepper .dot.active { background: var(--accent); transform: scale(1.4); }
     .stepper .dot.done { background: var(--accent-2); }
@@ -363,7 +363,8 @@
     }
     input[type=range]::-moz-range-thumb {
       width: 18px; height: 18px; border-radius: 50%;
-      background: #ff8c42; cursor: pointer; border: 2px solid var(--bg);
+      background: var(--accent); cursor: pointer; border: 2px solid var(--bg);
+      box-shadow: 0 4px 10px rgba(230, 57, 80, 0.5);
     }
     .slider-val {
       min-width: 36px; text-align: right;
@@ -846,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r10">
+<body data-build="vertcut-muxfix-2026-06-05-r11">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -902,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r10 · 4kfix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r11 · auditfix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1322,7 +1323,17 @@
           return () => map.get(ev)?.delete(fn);
         },
         off(ev, fn) { map.get(ev)?.delete(fn); },
-        emit(ev, payload) { map.get(ev)?.forEach((fn) => { try { fn(payload); } catch (e) { console.error(e); } }); },
+        emit(ev, payload) {
+          // r11: логируем payload на ошибке, чтобы не терять контекст.
+          // Раньше console.error(e) печатал только Error-объект без payload'а,
+          // и баг в подписчике (например, `p.ratio` undefined в прогресс-сабскрайбере)
+          // терял аргументы. Теперь — Error.stack + ev + payload.
+          map.get(ev)?.forEach((fn) => {
+            try { fn(payload); } catch (e) {
+              console.error(`[EventBus] subscriber for "${ev}" threw:`, e, 'payload =', payload);
+            }
+          });
+        },
       };
     })();
 
@@ -1335,6 +1346,8 @@
       inputUrl: null,
       inputMeta: null,        // { duration, width, height, size, fps? }
       inputCodecProbe: null,  // { videoCodec, audioCodec, width, height, duration } — заполняется MP4Box после загрузки
+      inputFFmpegName: null,  // r11: имя входного файла в FFmpeg FS (input.mp4 / input.webm / ...),
+                              // нужно чтобы cleanupBlobs() удалял именно его, а не только input.mp4
       transcodeAbort: null,   // AbortController, активный при идущем AV1→H.264 транскоде
 
       // Настройки нарезки
@@ -1390,41 +1403,74 @@
     // ====================================================================
     // IndexedDB-кеш для бинарников FFmpeg core
     // ====================================================================
+    // r11: IDB может быть недоступен (private mode, quota exceeded, file://).
+    // Кеш становится best-effort — если IDB не открывается, get/put возвращают
+    // null/no-op и fetchAllWithCache скачивает каждый раз без кеширования.
     const IDBCache = (() => {
       const DB_NAME = 'vertcut-cache';
       const DB_VER = 1;
       const STORE = 'ffmpeg';
+      let available = true;
 
       function open() {
+        if (!available) return Promise.reject(new Error('IDB disabled'));
         return new Promise((resolve, reject) => {
-          const req = indexedDB.open(DB_NAME, DB_VER);
-          req.onupgradeneeded = () => {
-            const db = req.result;
-            if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
-          };
-          req.onsuccess = () => resolve(req.result);
-          req.onerror = () => reject(req.error);
+          try {
+            const req = indexedDB.open(DB_NAME, DB_VER);
+            req.onupgradeneeded = () => {
+              const db = req.result;
+              if (!db.objectStoreNames.contains(STORE)) db.createObjectStore(STORE);
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => {
+              // r11: недоступно (private mode / quota / SecurityError)
+              available = false;
+              reject(req.error || new Error('IDB unavailable'));
+            };
+            req.onblocked = () => {
+              available = false;
+              reject(new Error('IDB blocked'));
+            };
+          } catch (e) {
+            available = false;
+            reject(e);
+          }
         });
       }
       async function get(key) {
-        const db = await open();
-        return new Promise((resolve, reject) => {
-          const tx = db.transaction(STORE, 'readonly');
-          const r = tx.objectStore(STORE).get(key);
-          r.onsuccess = () => resolve(r.result || null);
-          r.onerror = () => reject(r.error);
-        });
+        if (!available) return null;
+        try {
+          const db = await open();
+          return await new Promise((resolve) => {
+            const tx = db.transaction(STORE, 'readonly');
+            const r = tx.objectStore(STORE).get(key);
+            r.onsuccess = () => resolve(r.result || null);
+            r.onerror = () => resolve(null); // r11: best-effort
+          });
+        } catch (_) {
+          return null;
+        }
       }
       async function put(key, value) {
-        const db = await open();
-        return new Promise((resolve, reject) => {
-          const tx = db.transaction(STORE, 'readwrite');
-          tx.objectStore(STORE).put(value, key);
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-        });
+        if (!available) return;
+        try {
+          const db = await open();
+          await new Promise((resolve) => {
+            const tx = db.transaction(STORE, 'readwrite');
+            tx.objectStore(STORE).put(value, key);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => {
+              // r11: QuotaExceededError и т.п. — отключаем кеш, дальше
+              // get/put будут no-op, чтобы не зацикливаться на ошибках.
+              available = false;
+              resolve();
+            };
+          });
+        } catch (_) {
+          available = false;
+        }
       }
-      return { get, put };
+      return { get, put, isAvailable: () => available };
     })();
 
     // ====================================================================
@@ -1466,6 +1512,14 @@
       let ffmpeg = null;
       let progressFraction = 0;
       let fontBlobCache = null;
+      // r11: blob: URL'ы core/wasm/worker создаются в init() и висят в памяти
+      // до exit() (который обычно не вызывается). Храним их тут, чтобы при
+      // exit() или повторном init() отозвать (иначе ~25 MB утечки за сессию
+      // с несколькими отменами/перезапусками).
+      let coreBlobUrl = null;
+      let wasmBlobUrl = null;
+      let workerBlobUrl = null;
+      let libScriptBlobUrl = null;
       // Циклический буфер последних строк FFmpeg-лога. При ошибке мы
       // включаем последние ~12 строк в текст исключения — иначе ffmpeg.run
       // бросает голое «ffmpeg.wasm was killed by signal X» без контекста.
@@ -1530,10 +1584,21 @@
             return resolve();
           }
           const url = URL.createObjectURL(libBlob);
+          libScriptBlobUrl = url; // r11: для revoke после onload
           const script = document.createElement('script');
           script.src = url;
-          script.onload = () => resolve();
-          script.onerror = (e) => reject(new Error('Не удалось подгрузить ffmpeg.min.js'));
+          script.onload = () => {
+            // r11: скрипт уже выполнился, blob URL больше не нужен —
+            // отзываем сразу, чтобы не висел в памяти.
+            try { URL.revokeObjectURL(url); } catch (_) {}
+            libScriptBlobUrl = null;
+            resolve();
+          };
+          script.onerror = (e) => {
+            try { URL.revokeObjectURL(url); } catch (_) {}
+            libScriptBlobUrl = null;
+            reject(new Error('Не удалось подгрузить ffmpeg.min.js'));
+          };
           document.head.appendChild(script);
         });
       }
@@ -1550,9 +1615,14 @@
 
         // 3) Создаём blob: URL для core/wasm/worker — оба же same-origin,
         //    под COEP проходят без CORP-проверки.
-        const corePath   = URL.createObjectURL(blobs['ffmpeg-core.js']);
-        const wasmPath   = URL.createObjectURL(blobs['ffmpeg-core.wasm']);
-        const workerPath = URL.createObjectURL(blobs['ffmpeg-core.worker.js']);
+        // r11: сохраняем URL'ы в замыкании для revoke в exit() (иначе
+        // ~25 MB утечки на каждый повторный init() после отмены).
+        coreBlobUrl   = URL.createObjectURL(blobs['ffmpeg-core.js']);
+        wasmBlobUrl   = URL.createObjectURL(blobs['ffmpeg-core.wasm']);
+        workerBlobUrl = URL.createObjectURL(blobs['ffmpeg-core.worker.js']);
+        const corePath = coreBlobUrl;
+        const wasmPath = wasmBlobUrl;
+        const workerPath = workerBlobUrl;
 
         // 4) Инстанциируем FFmpeg (внутри он уже создаст свой воркер).
         const { createFFmpeg } = window.FFmpeg;
@@ -1651,6 +1721,12 @@
         try { ffmpeg.exit(); } catch (_) {}
         ffmpeg = null;
         AppState.ffmpegReady = false;
+        // r11: revoke blob: URL'ы core/wasm/worker, чтобы не висели в RAM
+        // (~25 MB) на случай отмены и повторного init().
+        try { if (coreBlobUrl)   { URL.revokeObjectURL(coreBlobUrl);   coreBlobUrl = null; } } catch (_) {}
+        try { if (wasmBlobUrl)   { URL.revokeObjectURL(wasmBlobUrl);   wasmBlobUrl = null; } } catch (_) {}
+        try { if (workerBlobUrl) { URL.revokeObjectURL(workerBlobUrl); workerBlobUrl = null; } } catch (_) {}
+        try { if (libScriptBlobUrl) { URL.revokeObjectURL(libScriptBlobUrl); libScriptBlobUrl = null; } } catch (_) {}
       }
 
       return {
@@ -1670,6 +1746,13 @@
       async function load(modelSize, onProgress) {
         const { pipeline } = await loadTransformers();
         if (pipe && currentModel === modelSize) return pipe;
+        // r11: при смене модели явно сбрасываем старую ссылку, чтобы
+        // ONNX-память (и связанные WASM-буферы) могла быть освобождена GC.
+        // transformers.js не даёт dispose(), но null-out ссылки здесь
+        // достаточно — следующая load() пересоздаст pipeline заново.
+        if (pipe && currentModel !== modelSize) {
+          try { pipe = null; } catch (_) {}
+        }
         const modelName = modelSize === 'base' ? 'Xenova/whisper-base' : 'Xenova/whisper-tiny';
         // Агрегируем прогресс по нескольким файлам модели (encoder, decoder,
         // tokenizer, config и т.д.) взвешенно по байтам. Иначе progress
@@ -2021,7 +2104,10 @@
           if (box) {
             const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
             box.write(stream);
-            return new Uint8Array(stream.buffer, 8); // вырезаем 8-байтный заголовок box
+            // r11: .slice() чтобы получить КОПИЮ данных, а не view поверх
+            // внутреннего буфера DataStream (который может быть переиспользован
+            // или освобождён mp4box'ом позже).
+            return new Uint8Array(stream.buffer, 8).slice();
           }
         }
         return null;
@@ -2039,7 +2125,11 @@
           return { ok: false, codec, reason: 'stsd box missing — контейнер нестандартный' };
         }
         const entries = trak.mdia.minf.stbl.stsd.entries || [];
-        const entryTypes = entries.map(e => e.type || e.getName ? e.getName() : '?').join(',');
+        // r11: e.type || (e.getName ? e.getName() : '?') — скобки нужны, иначе
+        // из-за приоритетов || и ?: парсится как (e.type || e.getName) ? e.getName : '?',
+        // и если e.type — непустая строка, а e.getName — не функция, упадёт
+        // с TypeError: e.getName is not a function.
+        const entryTypes = entries.map(e => e.type || (e.getName ? e.getName() : '?')).join(',');
         if (entries.length === 0) {
           return { ok: false, codec, reason: 'stsd.entries пустой — нет сэмплов' };
         }
@@ -2093,16 +2183,19 @@
       // Маппинг fourcc-строки из MP4Box → кодек, который понимает mp4-muxer.
       // Возвращает null для кодеков, которые пасстром не поддерживаем
       // (тогда в onReady audioTrack обнулится и muxer инициализируется без аудио).
+      // r11: MP4Box отдаёт RFC 6381 codec string ('mp4a.40.2', 'opus', 'flac'),
+      // а не сырой FOURCC ('mp4a'). Используем startsWith() чтобы корректно
+      // матчить префиксы (mp4a.40.2 = AAC LC, mp4a.40.5 = HE-AAC, и т.д.).
       function mapAudioMuxerCodec(fourcc) {
         if (!fourcc) return null;
         const c = String(fourcc).toLowerCase().trim();
-        if (c === 'mp4a') return 'aac';        // AAC
-        if (c === 'opus') return 'opus';        // Opus (YouTube, WebRTC)
-        if (c === 'flac') return 'flac';
-        if (c === 'ac-3') return 'ac-3';
-        if (c === 'ec-3') return 'ec-3';
-        if (c === 'mp3 ' || c === '.mp3') return 'mp3';
-        if (c === 'samr') return 'amr-nb';
+        if (c.startsWith('mp4a')) return 'aac';     // AAC LC/HE/HEv2
+        if (c.startsWith('opus')) return 'opus';     // Opus (YouTube, WebRTC)
+        if (c.startsWith('flac')) return 'flac';
+        if (c.startsWith('ac-3')) return 'ac-3';
+        if (c.startsWith('ec-3')) return 'ec-3';
+        if (c === 'mp3 ' || c === '.mp3' || c === 'mp3' || c === 'mp4a.6b' || c === 'mp4a.69') return 'mp3';
+        if (c === 'samr' || c === 'mp4a.6b' === c) return 'amr-nb';
         if (c === 'sawb') return 'amr-wb';
         return null; // неизвестный/неподдерживаемый — drop
       }
@@ -2247,21 +2340,57 @@
           }
         }
 
+        // r11: после videoEncoder.flush() больше не приходит output-callback,
+        // поэтому maybeComplete() сам себя не перевызовет. Планируем повторную
+        // проверку через 2.1с — если encoded-каунтер не растёт, resolveDone().
+        // Без этого await done() в main flow виснет НАВСЕГДА в нормальном
+        // сценарии (фикс регрессии r10).
+        function scheduleStabilityCheck() {
+          setTimeout(() => {
+            if (aborted) return;
+            if (!videoFlushDone) return; // ещё не flush'нулись
+            // Если encoded не изменился с момента последней проверки
+            // и уже прошло >2с с последнего реального encoded-кадра — done.
+            if (videoSamplesEncoded === lastEncodedCount && stableSinceTs > 0
+                && performance.now() - stableSinceTs > 2000) {
+              console.log('[vertcut] scheduleStabilityCheck: stability reached after flush');
+              try { resolveDone(); } catch (_) {}
+            } else if (videoSamplesEncoded > 0) {
+              // encoded растёт — перепланируем (на случай если mp4box
+              // послал ещё сэмплов ПОСЛЕ flush, что иногда бывает)
+              scheduleStabilityCheck();
+            }
+          }, 2100);
+        }
+
         // Бэкпрешер: ждём пока очередь декодера/энкодера не разгрузится.
         // r7: задержка уменьшена с 16мс до 4мс, и не дёргаем очередь если
         // она почти пустая — это даёт ~5-10% прироста на длинных файлах.
+        // r11: try-catch на queueSize — при abort() декодер/энкодер
+        // закрываются между проверкой и await, и тогда свойство бросает
+        // DOMException "InvalidStateError". Проверка `!aborted` первой
+        // — short-circuit, но между условием и await'ом может влезть
+        // abort, поэтому ловим.
         async function waitForQueueSpace() {
-          // Декодер: пропускаем ожидание, если в очереди < 20 кадров.
-          // (Лимит 24 в r6 был излишне консервативен.)
-          if (videoDecoder && videoDecoder.decodeQueueSize >= 20) {
-            while (videoDecoder && videoDecoder.decodeQueueSize > 12 && !aborted) {
-              await new Promise(r => setTimeout(r, 4));
+          try {
+            // Декодер: пропускаем ожидание, если в очереди < 20 кадров.
+            // (Лимит 24 в r6 был излишне консервативен.)
+            if (videoDecoder && videoDecoder.decodeQueueSize >= 20) {
+              while (!aborted && videoDecoder && videoDecoder.decodeQueueSize > 12) {
+                await new Promise(r => setTimeout(r, 4));
+              }
             }
-          }
-          // Энкодер: аналогично, и бэкпрешер нужен только если уже > 12.
-          if (videoEncoder && videoEncoder.encodeQueueSize >= 12) {
-            while (videoEncoder && videoEncoder.encodeQueueSize > 8 && !aborted) {
-              await new Promise(r => setTimeout(r, 4));
+            // Энкодер: аналогично, и бэкпрешер нужен только если уже > 12.
+            if (!aborted && videoEncoder && videoEncoder.encodeQueueSize >= 12) {
+              while (!aborted && videoEncoder && videoEncoder.encodeQueueSize > 8) {
+                await new Promise(r => setTimeout(r, 4));
+              }
+            }
+          } catch (e) {
+            // Если после закрытия свойство бросило — просто выходим,
+            // нас всё равно уже отменили или вот-вот отменят.
+            if (!aborted) {
+              console.warn('[vertcut] waitForQueueSpace error (continuing):', e && e.message);
             }
           }
         }
@@ -2576,6 +2705,9 @@
             // Если mp4box не вызвал onReady (битый/не-MP4 контейнер), декодеры так и
             // остались null — явно говорим, что не удалось разобрать файл.
             if (!videoDecoder || !videoEncoder) {
+              // r11: сначала резолвим pumpDone, иначе main flow навсегда
+              // зависнет на await pumpDone (фикс регрессии r10).
+              try { resolvePump(); } catch (_) {}
               rejectDone(new Error('MP4Box не смог разобрать файл (нет moov-бокса или нет AV1-видеотрека)'));
               return;
             }
@@ -2634,6 +2766,11 @@
         } finally {
           clearTimeout(flushWatchdog);
         }
+
+        // r11: после явного flush() encoder/decoder больше не выдают output,
+        // значит maybeComplete() сам себя не перевызовет. Запускаем
+        // автономный stability-checker.
+        if (flushOk) scheduleStabilityCheck();
 
         await done;
 
@@ -2751,7 +2888,9 @@
             dataSize = size;
             break;
           }
-          offset += 8 + size;
+          // r11: RIFF-chunks выравниваются до чётного размера. Без + (size & 1)
+          // на нечётных size смещение съезжает и следующий chunk не найдётся.
+          offset += 8 + size + (size & 1);
         }
         if (dataOffset < 0) throw new Error('WAV: чанк data не найден');
         const samples = dataSize / (bitsPerSample / 8) / numChannels;
@@ -2869,6 +3008,9 @@
         onPhase('clip', { i: 0, total: totalSteps, label: 'Загружаем видео в FFmpeg' });
         const buf = new Uint8Array(await file.arrayBuffer());
         const inputName = 'input.' + (file.name.split('.').pop() || 'mp4').toLowerCase();
+        // r11: запоминаем имя в FFmpeg FS чтобы cleanupBlobs() чистил
+        // именно это расширение, а не хардкоженный 'input.mp4'.
+        AppState.inputFFmpegName = inputName;
         await FFmpegCore.writeFile(inputName, buf);
 
         const results = [];
@@ -3000,8 +3142,10 @@
                     // не записал ни одного байта (например, libass упал
                     // на нечитаемом шрифте), не сохраняем «битый» blob —
                     // карточка останется с оригинальным клипом и subsError.
+                    // r11: пометим специальным сообщением, чтобы пользователь
+                    // понял, почему на карточке есть .srt, но нет видео с субами.
                     if (!finalData || finalData.byteLength === 0) {
-                      throw new Error('FFmpeg вернул пустой файл при вжигании субтитров.');
+                      throw new Error('FFmpeg вернул пустой файл при вжигании субтитров (libass не отрендерил SRT).');
                     }
                     const finalBlob = new Blob([finalData.buffer], { type: 'video/mp4' });
                     const finalUrl = URL.createObjectURL(finalBlob);
@@ -3202,13 +3346,29 @@
           card.dataset.index = clip.index;
 
           if (clip.error) {
-            card.innerHTML = `
-              <div class="clip-body">
-                <div class="clip-error">Ошибка клипа ${clip.index}: ${clip.error}</div>
-                <div class="clip-meta"><span>${fmt(clip.start)} → ${fmt(clip.end)}</span></div>
-                <div class="clip-actions"><button class="btn" data-action="retry">Попробовать снова</button></div>
-              </div>
-            `;
+            // r11: clip.error идёт из JS Error message или FFmpeg-лога и может
+            // содержать <, >, &, ". Используем textContent, а не innerHTML.
+            const body = document.createElement('div');
+            body.className = 'clip-body';
+            const err = document.createElement('div');
+            err.className = 'clip-error';
+            err.textContent = `Ошибка клипа ${clip.index}: ${clip.error}`;
+            const meta = document.createElement('div');
+            meta.className = 'clip-meta';
+            const span = document.createElement('span');
+            span.textContent = `${fmt(clip.start)} → ${fmt(clip.end)}`;
+            meta.appendChild(span);
+            const actions = document.createElement('div');
+            actions.className = 'clip-actions';
+            const retryBtn = document.createElement('button');
+            retryBtn.className = 'btn';
+            retryBtn.dataset.action = 'retry';
+            retryBtn.textContent = 'Попробовать снова';
+            actions.appendChild(retryBtn);
+            body.appendChild(err);
+            body.appendChild(meta);
+            body.appendChild(actions);
+            card.appendChild(body);
           } else {
             const url = pickUrl(clip);
             // Тег: «Субтитры» если активен with-subs, «SRT» если есть только srt-файл,
@@ -3218,28 +3378,48 @@
               : (clip.srtUrl && !clip.withSubsUrl
                   ? '<div class="clip-tag" style="background:rgba(124,154,255,0.25);color:#b9c7ff;">📝 SRT</div>'
                   : '');
+            // subTag и video src — управляемые нами строки, без user-input.
+            // Только subsError вставляем через textContent ниже.
+            const videoWrapCls = 'clip-video-wrap' + (isVertical ? '' : ' h-mode');
+            const noSpeechTag = clip.noSpeech
+              ? '<div class="clip-tag" style="background:rgba(245,197,74,0.2);color:#ffd97a;">Речь не обнаружена</div>'
+              : '';
+            const subToggle = clip.withSubsUrl
+              ? `<button class="icon-btn ${clip.subsActive ? 'is-on' : ''}" data-action="toggle-subs" title="Субтитры на клипе ON/OFF">🔤</button>`
+              : '';
+            const srtBtn = clip.srtUrl
+              ? '<button class="btn" data-action="download-srt">⬇ .srt</button>'
+              : '';
+            const editBtn = clip.segments
+              ? '<button class="btn btn-ghost" data-action="edit">✏️ Редактировать</button>'
+              : '';
+            const showSize = (clip.subsActive && clip.withSubsBlob) ? clip.withSubsBlob.size : clip.originalBlob.size;
             card.innerHTML = `
-              <div class="clip-video-wrap ${isVertical ? '' : 'h-mode'}">
+              <div class="${videoWrapCls}">
                 ${subTag}
-                ${clip.noSpeech ? '<div class="clip-tag" style="background:rgba(245,197,74,0.2);color:#ffd97a;">Речь не обнаружена</div>' : ''}
+                ${noSpeechTag}
                 <video src="${url}" controls loop muted playsinline preload="metadata"></video>
               </div>
               <div class="clip-body">
                 <div class="clip-meta">
                   <span class="mono">${fmt(clip.start)} → ${fmt(clip.end)}</span>
-                  <span class="mono">${fmtSize((clip.subsActive && clip.withSubsBlob) ? clip.withSubsBlob.size : clip.originalBlob.size)}</span>
+                  <span class="mono">${fmtSize(showSize)}</span>
                 </div>
                 <div class="clip-actions">
-                  ${clip.withSubsUrl ? `
-                    <button class="icon-btn ${clip.subsActive ? 'is-on' : ''}" data-action="toggle-subs" title="Субтитры на клипе ON/OFF">🔤</button>
-                  ` : ''}
+                  ${subToggle}
                   <button class="btn" data-action="download">⬇ Скачать клип</button>
-                  ${clip.srtUrl ? '<button class="btn" data-action="download-srt">⬇ .srt</button>' : ''}
-                  ${clip.segments ? '<button class="btn btn-ghost" data-action="edit">✏️ Редактировать</button>' : ''}
+                  ${srtBtn}
+                  ${editBtn}
                 </div>
-                ${clip.subsError ? `<div class="clip-no-speech">Субтитры не сгенерированы: ${clip.subsError}</div>` : ''}
               </div>
             `;
+            // r11: subsError через textContent (может содержать <, >, ", & из FFmpeg-лога)
+            if (clip.subsError) {
+              const subErrEl = document.createElement('div');
+              subErrEl.className = 'clip-no-speech';
+              subErrEl.textContent = `Субтитры не сгенерированы: ${clip.subsError}`;
+              card.querySelector('.clip-body').appendChild(subErrEl);
+            }
           }
 
           // Обработчики
@@ -3279,7 +3459,33 @@
       function toggleSubs(clip) {
         if (!clip.withSubsUrl) return;
         clip.subsActive = !clip.subsActive;
-        render(AppState.clips);
+        // r11: точечное обновление одной карточки вместо полного render()
+        // (который пересоздаёт все <video> элементы и сбрасывает их буферизацию).
+        updateCard(clip);
+      }
+      function updateCard(clip) {
+        const card = document.querySelector(`.clip-card[data-index="${clip.index}"]`);
+        if (!card) return;
+        // Переключаем src у существующего <video>
+        const video = card.querySelector('video');
+        if (video) {
+          const newUrl = pickUrl(clip);
+          if (video.src !== newUrl) {
+            video.src = newUrl;
+            video.load();
+          }
+        }
+        // Обновляем размер в мета
+        const metaSize = card.querySelectorAll('.clip-meta .mono');
+        if (metaSize && metaSize[1]) {
+          const size = (clip.subsActive && clip.withSubsBlob) ? clip.withSubsBlob.size : clip.originalBlob.size;
+          metaSize[1].textContent = fmtSize(size);
+        }
+        // Обновляем состояние иконки субтитров
+        const toggleBtn = card.querySelector('[data-action="toggle-subs"]');
+        if (toggleBtn) {
+          toggleBtn.classList.toggle('is-on', !!clip.subsActive);
+        }
       }
 
       async function downloadAll() {
@@ -3296,9 +3502,11 @@
 
       function toggleAll(value) {
         for (const c of AppState.clips) {
-          if (c.withSubsUrl) c.subsActive = value;
+          if (c.withSubsUrl) {
+            c.subsActive = value;
+            updateCard(c); // r11: точечное обновление вместо render()
+          }
         }
-        render(AppState.clips);
       }
 
       // ============= Редактор SRT =============
@@ -3372,7 +3580,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r10 · 4kfix', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r11 · auditfix', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3734,6 +3942,9 @@
             const tid = setTimeout(() => rej(new Error('Не удалось прочитать метаданные транскодированного файла за 15 секунд')), 15000);
             previewVideo.onloadedmetadata = () => {
               clearTimeout(tid);
+              // r11: сбрасываем handler, чтобы он не сработал повторно
+              // при последующей загрузке другого файла через handleFile().
+              previewVideo.onloadedmetadata = null;
               const meta = {
                 duration: previewVideo.duration,
                 width: previewVideo.videoWidth,
@@ -3746,6 +3957,8 @@
             };
             previewVideo.onerror = () => {
               clearTimeout(tid);
+              previewVideo.onerror = null;
+              previewVideo.onloadedmetadata = null;
               rej(new Error('Видео-элемент не смог загрузить транскодированный MP4 (возможно, испорчен muxer-вывод)'));
             };
             const newUrl = URL.createObjectURL(newFile);
@@ -3884,20 +4097,31 @@
         tl.appendChild(marker);
       }
 
-      // Предупреждение по длине
-      function updateClipsCountWarning() {
+      // r11: разделено на validate (чистая) и apply (UI+store mutation).
+      // Возвращает скорректированное число клипов (или исходное если ОК).
+      function validateClipsCount() {
         const dur = AppState.inputMeta?.duration || 0;
         const len = AppState.settings.clipLength;
         let count = AppState.settings.clipsCount;
-        if (AppState.settings.strategy === 'manual') count = AppState.settings.manualMarkers.length;
+        if (AppState.settings.strategy === 'manual') return count;
+        const max = Math.max(1, Math.floor(dur / len));
+        return count * len > dur ? max : count;
+      }
+      function applyClipsCount(max) {
+        AppState.settings.clipsCount = max;
+        if (sliderCount) sliderCount.value = max;
+        if (valCount) valCount.textContent = String(max);
+      }
+      function updateClipsCountWarning() {
+        const dur = AppState.inputMeta?.duration || 0;
+        const len = AppState.settings.clipLength;
         const banner = document.getElementById('warn-banner');
         const max = Math.max(1, Math.floor(dur / len));
-        if (count * len > dur && AppState.settings.strategy !== 'manual') {
+        const adjusted = validateClipsCount();
+        if (adjusted !== AppState.settings.clipsCount) {
           banner.classList.add('is-visible');
           banner.textContent = `Видео слишком короткое: при длине клипа ${len}s максимум ${max} клипов. Корректируем автоматически.`;
-          AppState.settings.clipsCount = max;
-          sliderCount.value = max;
-          valCount.textContent = max;
+          applyClipsCount(adjusted);
         } else {
           banner.classList.remove('is-visible');
         }
@@ -3905,12 +4129,25 @@
 
       // Субтитры — переключатель
       const cbSubs = document.getElementById('cb-subs');
+      function syncSubsBlockVisibility(enabled) {
+        // r11: единая точка для скрытия/показа панелей субтитров —
+        // вызывается и при ручном toggle, и при runtime-отключении
+        // (например, если Whisper не загрузился и мы сбросили settings.subsEnabled).
+        const subsBlock = document.getElementById('subs-block');
+        const subsStyle = document.getElementById('subs-style-panel');
+        if (subsBlock)  subsBlock.classList.toggle('is-visible',  enabled);
+        if (subsStyle)  subsStyle.classList.toggle('is-visible',  enabled);
+        if (cbSubs.checked !== enabled) cbSubs.checked = enabled;
+      }
       cbSubs.addEventListener('change', () => {
         AppState.settings.subsEnabled = cbSubs.checked;
-        document.getElementById('subs-block').classList.toggle('is-visible', cbSubs.checked);
-        document.getElementById('subs-style-panel').classList.toggle('is-visible', cbSubs.checked);
+        syncSubsBlockVisibility(cbSubs.checked);
         UI.setPhaseProgress('whisper', 0, cbSubs.checked ? 'ожидаем загрузки' : 'не требуется');
       });
+      // r11: инициализация видимости по текущему значению (на случай, если
+      // settings.subsEnabled выключили в startProcessing() после ошибки
+      // Whisper, и теперь UI должен это отразить).
+      syncSubsBlockVisibility(AppState.settings.subsEnabled);
 
       // Селекторы языка/модели/формата
       const segLang = document.getElementById('subs-lang');
@@ -4121,6 +4358,11 @@
             console.error(e);
             UI.toast('Whisper не загрузился: ' + e.message + '. Продолжаем без субтитров.', 'warn', 6000);
             AppState.settings.subsEnabled = false;
+            // r11: если пользователь вернётся на экран настроек, не должно
+            // быть видимых панелей субтитров при выключенном флаге.
+            if (typeof syncSubsBlockVisibility === 'function') {
+              syncSubsBlockVisibility(false);
+            }
             UI.setPhaseProgress('whisper', 0, 'ошибка — пропускаем');
           }
         }
@@ -4241,15 +4483,23 @@
         if (e.key === 'Escape') GalleryManager.closeEditor();
       });
 
-      // Очистка blob URL'ов при «начать заново»
-      function cleanupBlobs() {
-        AppState.blobUrls.forEach((u) => URL.revokeObjectURL(u));
-        AppState.blobUrls.clear();
-        // Чистим input в FFmpeg FS на всякий случай
-        if (AppState.ffmpegReady) {
-          try { FFmpegCore.unlink('input.mp4'); } catch (_) {}
+        // Очистка blob URL'ов при «начать заново»
+        function cleanupBlobs() {
+          AppState.blobUrls.forEach((u) => URL.revokeObjectURL(u));
+          AppState.blobUrls.clear();
+          // Чистим input в FFmpeg FS на всякий случай.
+          // r11: имя может быть input.webm / input.mov / input.avi / input.mp4
+          // (определяется расширением исходника), а не только input.mp4.
+          if (AppState.ffmpegReady) {
+            const name = AppState.inputFFmpegName || 'input.mp4';
+            try { FFmpegCore.unlink(name); } catch (_) {}
+            // Попробуем также популярные альтернативы — могли остаться
+            // от предыдущих запусков.
+            ['input.mp4', 'input.webm', 'input.mov', 'input.avi', 'input.mkv']
+              .forEach((n) => { if (n !== name) { try { FFmpegCore.unlink(n); } catch (_) {} } });
+            AppState.inputFFmpegName = null;
+          }
         }
-      }
 
       // Пульсация кнопки «Начать нарезку» пока FFmpeg не готов
       const btnStart = document.getElementById('btn-start');
