@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r13">
+<body data-build="vertcut-muxfix-2026-06-05-r14">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r13 · sabfix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r14 · cleanup</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -2276,7 +2276,10 @@
         if (c.startsWith('ac-3')) return 'ac-3';
         if (c.startsWith('ec-3')) return 'ec-3';
         if (c === 'mp3 ' || c === '.mp3' || c === 'mp3' || c === 'mp4a.6b' || c === 'mp4a.69') return 'mp3';
-        if (c === 'samr' || c === 'mp4a.6b' === c) return 'amr-nb';
+        // r14: предыдущее 'c === 'mp4a.6b' === c' — это всегда false
+        // (оно парсилось как (c === 'mp4a.6b') === c, что логически бессмысленно).
+        // mp4a.6b/69 уже обработаны выше как 'mp3', тут остаётся только samr.
+        if (c === 'samr') return 'amr-nb';
         if (c === 'sawb') return 'amr-wb';
         return null; // неизвестный/неподдерживаемый — drop
       }
@@ -3661,7 +3664,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r13 · sabfix', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r14 · cleanup', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3890,9 +3893,15 @@
         // перенос потоков, кодеки сохраняются) — это быстро, ~1-3 секунды.
         let transcodingFile = AppState.inputFile;
         if (probe && probe.container === 'webm' && probe.videoCodec && Transcoder.isAV1(probe.videoCodec)) {
-          setTransProgress(0, 'Remux WebM → MP4 (без перекодирования)…');
+          setTransProgress(0, 'Загрузка ffmpeg-core для remux…');
           try {
-            await FFmpegCore.init(() => { /* init без progress — мы ещё не на processing */ });
+            // r14: передаём настоящий progress-callback, иначе пользователь
+            // не видит 22MB загрузки ffmpeg-core.js/wasm на первом WebM-AV1
+            // (init() их качает/распаковывает в WASM heap). Ограничиваем
+            // видимый прогресс 0..5% от всего транскода — remux только начало.
+            await FFmpegCore.init((frac) => {
+              setTransProgress(0.05 * Math.min(1, frac), `Загрузка ffmpeg-core · ${Math.round(frac * 100)}%`);
+            });
             const inputName = 'webm_in.' + (AppState.inputFile.name.split('.').pop() || 'webm').toLowerCase();
             const outputName = 'webm_out.mp4';
             const buf = new Uint8Array(await AppState.inputFile.arrayBuffer());
@@ -3906,8 +3915,8 @@
             const remuxOff = EventBus.on('ffmpeg:progress', (p) => {
               if (typeof p.ratio === 'number' && p.ratio > remuxProgressLast) {
                 remuxProgressLast = p.ratio;
-                // remux = 0..10% от общего прогресса (он быстрый)
-                setTransProgress(0.05 * Math.min(1, p.ratio), `Remux WebM → MP4 · ${Math.round(p.ratio * 100)}%`);
+                // remux = 5..10% от общего прогресса (он быстрый, после init)
+                setTransProgress(0.05 + 0.05 * Math.min(1, p.ratio), `Remux WebM → MP4 · ${Math.round(p.ratio * 100)}%`);
               }
             });
             try {
