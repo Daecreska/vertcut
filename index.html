@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r17">
+<body data-build="vertcut-muxfix-2026-06-05-r18">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r17 · short-vid</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r18 · subs-fix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1103,12 +1103,8 @@
             <h4 class="panel-title" style="font-size:12px;">Шрифт</h4>
             <div class="field-row">
               <label class="k">Семейство</label>
-              <select id="ss-family" class="input">
-                <option value="Arial">Arial</option>
-                <option value="Impact">Impact</option>
-                <option value="Montserrat">Montserrat</option>
-                <option value="Oswald">Oswald</option>
-                <option value="Bebas Neue">Bebas Neue</option>
+              <select id="ss-family" class="input" disabled title="Только Liberation Sans — ограничение FFmpeg.wasm (libass использует один TTF из /fonts)">
+                <option value="Liberation Sans">Liberation Sans</option>
               </select>
             </div>
             <div class="field-row">
@@ -1509,11 +1505,20 @@
       // Шрифт для subtitles-фильтра: ffmpeg-core 0.11 не содержит шрифтов,
       // libass без них рендерит пустой кадр. Подкладываем Roboto (~34KB)
       // в виртуальную FS и указываем fontsdir в фильтре.
-      const FONT_KEY = 'fallback-font.ttf';
-      const FONT_URL = 'https://cdn.jsdelivr.net/fontsource/fonts/roboto@latest/latin-400-normal.ttf';
+      // r18: меняем шрифт с Roboto на Liberation Sans. Главная причина —
+      // Roboto из fontsource latin-400-normal.ttf имеет внутреннее
+      // family name "Roboto Latin" (а не "Roboto"), libass ищет по
+      // точному совпадению и не находит → рендерит пустой кадр.
+      // Liberation Sans — гарантированно "Liberation Sans" в TTF name
+      // table, и метрически совместим с Arial. Версионируем ключ
+      // кеша: FONT_KEY='fallback-font-v2.ttf'. Иначе после смены URL
+      // IDB-кеш навсегда хранит старый файл (CDN @latest может
+      // обновиться, юзер не получит новый).
+      const FONT_KEY = 'fallback-font-v2.ttf';
+      const FONT_URL = 'https://cdn.jsdelivr.net/npm/@fontsource/liberation-sans@5.0.4/files/liberation-sans-latin-400-normal.ttf';
+      const FONT_FS_NAME = 'LiberationSans-Regular.ttf';
       // Имя файла шрифта внутри FFmpeg FS — обязательно с расширением .ttf,
       // libass распознаёт font family по содержимому файла, а не по имени.
-      const FONT_FS_NAME = 'Roboto-Regular.ttf';
 
       let ffmpeg = null;
       let progressFraction = 0;
@@ -1933,7 +1938,13 @@
       // fontsdir. Мы кладём в /fonts один шрифт Roboto и ВСЕГДА указываем
       // FontName=Roboto в force_style — иначе libass не находит запрошенный
       // фонт и рендерит пустой кадр без ошибки. На превью оставляем оригинал.
-      function buildForceStyle(style) {
+      // r18: buildForceStyle принимает опциональные videoW/videoH.
+      // Без скейла FontSize=22 на 1080p-видео был бы 22px (1.1% высоты,
+      // нечитаемо). Считаем коэффициент scale = videoH / 288 (т.к. дефолтный
+      // PlayResY в libass = 288) и пропорционально домножаем size/outlineW.
+      // MarginV теперь — в процентах от videoH (style.margin уже в %).
+      // Если videoH не передан — fallback на 288 (старое поведение).
+      function buildForceStyle(style, videoW, videoH) {
         const map = {
           'top-left': 7, 'top-center': 8, 'top-right': 9,
           'middle-left': 4, 'middle-center': 5, 'middle-right': 6,
@@ -1946,20 +1957,30 @@
         const borderStyle = style.bgType === 'bar' || style.bgType === 'rounded' ? 3 : 1;
         const outlineThickness = style.outlineW || 0;
         const shadow = style.bgType === 'shadow' ? 2 : 0;
-        // libass без явного [Script Info] использует PlayResY=288 для скейла,
-        // поэтому MarginV считаем в этой системе координат, а не в пикселях
-        // итогового видео — иначе субтитры уезжают к центру кадра.
-        const marginV = Math.round((style.margin / 100) * 288);
+        // r18: считаем marginV в ПИКСЕЛЯХ фактического видео, не в % от 288.
+        // style.margin — это % от высоты видео (как его видит пользователь
+        // в UI, независимо от внутреннего PlayResY libass).
+        // libass с force_style='...' использует PlayResY=288, поэтому
+        // переводим реальные пиксели обратно в units 288-системы.
+        const h = videoH || 288;
+        const pxMarginV = Math.round((style.margin / 100) * h);
+        const marginV = Math.round(pxMarginV * 288 / h);
+        // r18: FontSize и Outline масштабируем пропорционально videoH/288.
+        // Это работает и для PlayResY=720 (другой дефолт в старых libass)
+        // — в крайнем случае субтитры просто чуть крупнее/мельче.
+        const scale = h / 288;
+        const fontSize = Math.max(8, Math.round(style.size * scale));
+        const scaledOutline = Math.max(0, Math.round(outlineThickness * scale));
         const parts = [
-          `FontName=Roboto`,
-          `FontSize=${style.size}`,
+          `FontName=Liberation Sans`,
+          `FontSize=${fontSize}`,
           `Bold=${style.bold ? -1 : 0}`,
           `Italic=${style.italic ? -1 : 0}`,
           `PrimaryColour=${primary}`,
           `OutlineColour=${outline}`,
           `BackColour=${back}`,
           `BorderStyle=${borderStyle}`,
-          `Outline=${outlineThickness}`,
+          `Outline=${scaledOutline}`,
           `Shadow=${shadow}`,
           `Alignment=${alignment}`,
           `MarginV=${marginV}`,
@@ -3039,10 +3060,16 @@
         }
 
         // Стратегия 1: быстрый seek + reencode (для 9:16) или copy (для 16:9)
+        // r18: для 9:16 добавили scale перед crop. Без неё исходники уже
+        // вертикальнее 9:16 (узкие вертикальные, iw < ih*9/16) давали
+        // crop с отрицательным x-offset (iw - ih*9/16 < 0) → FFmpeg
+        // error "width/height outside the image boundaries".
+        // Логика: сначала уменьшаем ширину пропорционально так, чтобы
+        // итоговое соотношение было >= 9:16, потом crop по центру.
         const fastArgs = aspect === '9:16'
           ? [
               '-ss', String(start), '-i', inputName, '-t', String(dur),
-              '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
+              '-vf', 'scale=iw*max(1\\,ih*9/(iw*16)):ih:flags=lanczos,crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
               '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
               '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
               clipName,
@@ -3063,10 +3090,12 @@
         await FFmpegCore.unlink(clipName);
 
         // Стратегия 2: точный seek (после -i) + reencode для обоих aspect
+        // r18: см. fastArgs — scale перед crop для безопасной обработки
+        // узких вертикальных исходников.
         const accurateArgs = aspect === '9:16'
           ? [
               '-i', inputName, '-ss', String(start), '-t', String(dur),
-              '-vf', 'crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
+              '-vf', 'scale=iw*max(1\\,ih*9/(iw*16)):ih:flags=lanczos,crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
               '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
               '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
               clipName,
@@ -3191,7 +3220,15 @@
                   clearInterval(tick);
                 }
                 const chunks = (tr && tr.chunks) ? tr.chunks : [];
-                const cleanChunks = chunks.filter((c) => c && c.text && c.text.trim().length > 0);
+                // r18: фильтруем не только пустой текст, но и null timestamps.
+                // Иначе chunksToSRT их тихо дропнет, SRT окажется пустым,
+                // libass получит пустые субтитры и видео выйдет без букв —
+                // при этом subsActive=true и карточка покажет «Субтитры».
+                const cleanChunks = chunks.filter((c) =>
+                  c && c.text && c.text.trim().length > 0
+                       && c.timestamp && Array.isArray(c.timestamp)
+                       && c.timestamp[0] != null && c.timestamp[1] != null
+                );
                 if (cleanChunks.length === 0) {
                   clipResult.noSpeech = true;
                   clipResult.subsActive = false;
@@ -3211,38 +3248,51 @@
                       label: `Вжигание субтитров · клип ${i + 1}/${totalSteps}`,
                       pct: 70,
                     });
-                    await FFmpegCore.ensureFontInFS();
+                    // r18: try/finally — temp-файлы subName/finalName чистятся
+                    // и при ошибке FFmpeg. До этого при exception они оставались
+                    // в Emscripten FS и накапливались при обработке >1 клипа
+                    // (в худшем случае — QuotaExceededError FS).
                     const subName = `sub_${i + 1}.srt`;
-                    await FFmpegCore.writeFile(subName, new TextEncoder().encode(srt));
                     const finalName = `final_${i + 1}.mp4`;
-                    const force = SubtitleManager.buildForceStyle(settings.subsStyle);
-                    // Экранируем апостроф/двоеточие для filter
-                    const safeForce = force.replace(/'/g, "\\'");
-                    const vf = `subtitles=${subName}:fontsdir=/fonts:force_style='${safeForce}'`;
-                    await FFmpegCore.run([
-                      '-i', clipName,
-                      '-vf', vf,
-                      '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
-                      '-c:a', 'copy',
-                      finalName,
-                    ]);
-                    const finalData = await FFmpegCore.readFile(finalName);
-                    // Аналогичная защита от пустого вывода: если ffmpeg
-                    // не записал ни одного байта (например, libass упал
-                    // на нечитаемом шрифте), не сохраняем «битый» blob —
-                    // карточка останется с оригинальным клипом и subsError.
-                    // r11: пометим специальным сообщением, чтобы пользователь
-                    // понял, почему на карточке есть .srt, но нет видео с субами.
-                    if (!finalData || finalData.byteLength === 0) {
-                      throw new Error('FFmpeg вернул пустой файл при вжигании субтитров (libass не отрендерил SRT).');
+                    try {
+                      await FFmpegCore.ensureFontInFS();
+                      await FFmpegCore.writeFile(subName, new TextEncoder().encode(srt));
+                      // r18: передаём videoW/videoH чтобы libass корректно
+                      // масштабировал FontSize/Outline/MarginV под фактическое
+                      // разрешение. Без этого FontSize=22 на 1080p-видео = 22px
+                      // из 1920 = 1.1% высоты → нечитаемые микросубтитры.
+                      const videoW = AppState.inputMeta?.width || 1080;
+                      const videoH = AppState.inputMeta?.height || 1920;
+                      const force = SubtitleManager.buildForceStyle(settings.subsStyle, videoW, videoH);
+                      // Экранируем апостроф/двоеточие для filter
+                      const safeForce = force.replace(/'/g, "\\'");
+                      const vf = `subtitles=${subName}:fontsdir=/fonts:force_style='${safeForce}'`;
+                      await FFmpegCore.run([
+                        '-i', clipName,
+                        '-vf', vf,
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                        '-c:a', 'copy',
+                        finalName,
+                      ]);
+                      const finalData = await FFmpegCore.readFile(finalName);
+                      // Аналогичная защита от пустого вывода: если ffmpeg
+                      // не записал ни одного байта (например, libass упал
+                      // на нечитаемом шрифте), не сохраняем «битый» blob —
+                      // карточка останется с оригинальным клипом и subsError.
+                      // r11: пометим специальным сообщением, чтобы пользователь
+                      // понял, почему на карточке есть .srt, но нет видео с субами.
+                      if (!finalData || finalData.byteLength === 0) {
+                        throw new Error('FFmpeg вернул пустой файл при вжигании субтитров (libass не отрендерил SRT).');
+                      }
+                      const finalBlob = new Blob([finalData], { type: 'video/mp4' });
+                      const finalUrl = URL.createObjectURL(finalBlob);
+                      AppState.blobUrls.add(finalUrl);
+                      clipResult.withSubsBlob = finalBlob;
+                      clipResult.withSubsUrl = finalUrl;
+                    } finally {
+                      try { await FFmpegCore.unlink(subName); } catch (_) {}
+                      try { await FFmpegCore.unlink(finalName); } catch (_) {}
                     }
-                    const finalBlob = new Blob([finalData], { type: 'video/mp4' });
-                    const finalUrl = URL.createObjectURL(finalBlob);
-                    AppState.blobUrls.add(finalUrl);
-                    clipResult.withSubsBlob = finalBlob;
-                    clipResult.withSubsUrl = finalUrl;
-                    await FFmpegCore.unlink(subName);
-                    await FFmpegCore.unlink(finalName);
                   }
                   clipResult.subsActive = !!clipResult.withSubsUrl;
                 }
@@ -3291,7 +3341,10 @@
         const srt = SubtitleManager.segmentsToSRT(segments);
         await FFmpegCore.writeFile(subName, new TextEncoder().encode(srt));
         await FFmpegCore.ensureFontInFS();
-        const force = SubtitleManager.buildForceStyle(settings.subsStyle);
+        // r18: pass videoW/videoH for proper FontSize/Outline/MarginV scaling
+        const videoW2 = AppState.inputMeta?.width || 1080;
+        const videoH2 = AppState.inputMeta?.height || 1920;
+        const force = SubtitleManager.buildForceStyle(settings.subsStyle, videoW2, videoH2);
         const safeForce = force.replace(/'/g, "\\'");
         const vf = `subtitles=${subName}:fontsdir=/fonts:force_style='${safeForce}'`;
         await FFmpegCore.run([
@@ -3669,7 +3722,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r17 · short-vid', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r18 · subs-fix', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3732,11 +3785,21 @@
         }
       }
 
+      // r18: монотонный счётчик загрузок файла. Каждый handleFile инкрементит,
+      // и любые async-callbacks (probe, onloadedmetadata) проверяют что
+      // их loadSeq всё ещё текущий. Иначе probe-2 мог бы перезаписать
+      // inputCodecProbe данными от file-1 если file-2 загрузился пока
+      // probe-1 ещё бежал.
+      let loadSeq = 0;
       function handleFile(file) {
         if (!file.type.startsWith('video/')) {
           UI.toast('Это не похоже на видео-файл', 'warn');
           return;
         }
+        // r18: помечаем эту загрузку уникальным id. Любой поздний callback
+        // (probe, onloadedmetadata) сначала проверит что mySeq всё ещё
+        // актуален, иначе просто выйдет.
+        const mySeq = ++loadSeq;
         // Освободим предыдущий URL если был
         if (AppState.inputUrl) URL.revokeObjectURL(AppState.inputUrl);
         AppState.inputFile = file;
@@ -3744,8 +3807,8 @@
         if (codecBadgeEl) codecBadgeEl.classList.add('hidden');
         const url = URL.createObjectURL(file);
         AppState.inputUrl = url;
-        previewVideo.src = url;
         previewVideo.onloadedmetadata = () => {
+          if (mySeq !== loadSeq) return; // r18: stale callback, файл уже сменили
           const meta = {
             duration: previewVideo.duration,
             width: previewVideo.videoWidth,
@@ -3785,7 +3848,10 @@
             ? Transcoder.probeCodecWebM(file)
             : Transcoder.probeCodec(file);
           probePromise.then((probe) => {
-            if (AppState.inputFile !== file) return; // сменили файл пока пробили
+            // r18: проверка loadSeq вместо inputFile !== file (предыдущая
+            // проверка могла miss-нуть если новый handleFile уже выставил
+            // inputFile но ещё не успел заинкрементить loadSeq в callback).
+            if (mySeq !== loadSeq) return;
             AppState.inputCodecProbe = probe;
             renderCodecBadge(probe);
           }).catch(() => { /* мягкий fail — не показываем бейдж */ });
@@ -4492,9 +4558,32 @@
           if (!t) return;
           seg.querySelectorAll('button').forEach((b) => b.classList.toggle('is-active', b === t));
           AppState.settings.subsStyle[styleSegs[id]] = t.dataset.v;
+          // r18: при смене bgType обновляем подсказку на outline-слайдере
+          // (при bar/rounded libass игнорирует Outline, при BorderStyle=3).
+          syncOutlineHint(AppState.settings.subsStyle.bgType);
           updatePreview();
         });
       }
+      // r18: при BorderStyle=3 (opaque box для bar/rounded) libass
+      // ИГНОРИРУЕТ Outline. Без подсказки пользователь видит слайдер,
+      // двигает его, и не понимает почему обводка не рисуется. Дизейблим
+      // слайдер + tooltip с пояснением.
+      function syncOutlineHint(bgType) {
+        const slider = document.getElementById('ss-outline-w');
+        const val = document.getElementById('ss-outline-w-val');
+        if (!slider) return;
+        if (bgType === 'bar' || bgType === 'rounded') {
+          slider.disabled = true;
+          slider.title = 'Обводка не рисуется при фоне bar/rounded (libass: BorderStyle=3 = opaque box, Outline игнорируется)';
+          if (val) val.style.opacity = '0.4';
+        } else {
+          slider.disabled = false;
+          slider.title = '';
+          if (val) val.style.opacity = '';
+        }
+      }
+      // Инициализация подсказки при загрузке (на случай bgType по умолчанию = bar)
+      syncOutlineHint(AppState.settings.subsStyle.bgType);
 
       function updatePreview() {
         const sub = document.getElementById('preview-sub');
@@ -4533,6 +4622,7 @@
           document.querySelectorAll('#' + segId + ' button').forEach((b) => b.classList.toggle('is-active', b.dataset.v === v));
         };
         segPick('ss-bg-type', s.bgType);
+        syncOutlineHint(s.bgType); // r18: обновить disabled/tooltip на outline-слайдере
         segPick('ss-pos-v', s.posV);
         segPick('ss-pos-h', s.posH);
         segPick('ss-anim', s.anim);
