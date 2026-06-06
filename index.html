@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r14">
+<body data-build="vertcut-muxfix-2026-06-05-r15">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r14 · cleanup</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r15 · clip-recover</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -3664,7 +3664,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r14 · cleanup', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r15 · clip-recover', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -4318,9 +4318,17 @@
           }
           // r12: сбрасываем clipsCount в 0 чтобы startProcessing() сразу
           // увидел «нечего нарезать» и показал чистый error, а не молчание.
+          // r15: слайдер имеет min="1" — если поставить value=0, браузер
+          // зажмёт в 1, а clipsCount=0 застрянет, и при изменении clipLength
+          // обратно на нормальный — слайдер будет показывать 1, а count=0.
+          // Решение: держим слайдер на min=1 (визуально «минимум»), но
+          // clipsCount явно ставим 0 — startProcessing увидит 0 и заблокируется.
+          // Когда пользователь уменьшит clipLength до нормы — следующий
+          // вызов updateClipsCountWarning() пройдёт дальше videoTooShort
+          // и validateClipsCount() восстановит счётчик с 1.
           if (AppState.settings.clipsCount !== 0) {
             AppState.settings.clipsCount = 0;
-            if (sliderCount) sliderCount.value = 0;
+            if (sliderCount) sliderCount.value = sliderCount.min || '1';
             if (valCount) valCount.textContent = '0';
           }
           return;
@@ -4330,6 +4338,15 @@
           btn.title = '';
         }
         const max = Math.max(1, Math.floor(dur / len));
+        // r15: восстановление после videoTooShort — если clipsCount=0 был
+        // выставлен в предыдущем вызове (видео было слишком короткое),
+        // а теперь пользователь уменьшил clipLength и видео подходит —
+        // нужно поднять clipsCount обратно. validateClipsCount() возвращает
+        // 0*len=0, не >dur, и просто вернёт 0 — не поможет. Поэтому
+        // отдельно проверяем clipsCount===0.
+        if (AppState.settings.clipsCount === 0) {
+          applyClipsCount(max);
+        }
         const adjusted = validateClipsCount();
         if (adjusted !== AppState.settings.clipsCount) {
           banner.classList.add('is-visible');
