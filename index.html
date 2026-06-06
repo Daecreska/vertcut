@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r22">
+<body data-build="vertcut-muxfix-2026-06-05-r23">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r22 · gpu-throttle</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r23 · scope-fix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1393,6 +1393,23 @@
       clips: [],     // см. ниже структуру
       blobUrls: new Set(),
     };
+
+    // r23: вынесены из init() — нужны и в VideoProcessor (FFmpeg args),
+    // и в transcodeAV1ToH264 (WebCodecs config), и в init() (pill UI).
+    // Держать на верхнем уровне script-IIFE, чтобы все вложенные
+    // модули (WhisperCore, VideoProcessor, ...) видели их.
+    function getFFmpegThreads() {
+      // navigator.hardwareConcurrency есть везде кроме file://
+      const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+      const n = Math.max(1, Math.floor(hw * AppState.settings.gpuLoad));
+      return n;
+    }
+    function getLatencyHint() {
+      // 'power-efficient' для 50%, иначе 'realtime' (дефолт).
+      // 'quality' нам не подходит — мы НЕ хотим медленнее, мы хотим
+      // меньше GPU. Поэтому только два значения.
+      return AppState.settings.gpuLoad <= 0.5 ? 'power-efficient' : 'realtime';
+    }
 
     function defaultStyle() {
       return {
@@ -4392,6 +4409,9 @@
       //   3) Whisper (ONNX): нет API-ручки. На 50% добавляем
       //      искусственную паузу между чанками — снижает пиковую
       //      нагрузку на CPU, хоть и удлиняет обработку.
+      // r23: getFFmpegThreads/getLatencyHint вынесены на верхний уровень
+      // (рядом с AppState), чтобы VideoProcessor.cutClipWithFallback
+      // и transcodeAV1ToH264 (вне init()) тоже могли их вызывать.
       const pillGpu = document.getElementById('pill-gpu');
       pillGpu.addEventListener('click', (e) => {
         const t = e.target.closest('.pill');
@@ -4402,18 +4422,6 @@
           'ffmpeg-threads:', getFFmpegThreads(),
           'latencyHint:', getLatencyHint());
       });
-      function getFFmpegThreads() {
-        // navigator.hardwareConcurrency есть везде кроме file://
-        const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
-        const n = Math.max(1, Math.floor(hw * AppState.settings.gpuLoad));
-        return n;
-      }
-      function getLatencyHint() {
-        // 'power-efficient' для 50%, иначе 'realtime' (дефолт).
-        // 'quality' нам не подходит — мы НЕ хотим медленнее, мы хотим
-        // меньше GPU. Поэтому только два значения.
-        return AppState.settings.gpuLoad <= 0.5 ? 'power-efficient' : 'realtime';
-      }
 
       const sliderCount = document.getElementById('slider-count');
       const valCount = document.getElementById('val-count');
