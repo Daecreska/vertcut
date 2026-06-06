@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r21">
+<body data-build="vertcut-muxfix-2026-06-05-r22">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r21 · src-restore</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r22 · gpu-throttle</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1010,6 +1010,15 @@
                 <div class="muted small">YouTube / оригинал</div>
               </div>
             </div>
+          </div>
+
+          <div class="sep"></div>
+
+          <h3 class="panel-title">Нагрузка на систему</h3>
+          <div class="pill-row" id="pill-gpu" title="Ограничивает CPU-потоки FFmpeg и выбор latency hint в WebCodecs. 100% — максимум (по умолчанию). 50% — в два раза меньше потоков, encoder работает в power-efficient режиме. Может удлинить обработку, но снижает нагрев/лаг на слабых машинах.">
+            <div class="pill" data-v="0.5">50% <span class="sub">эко</span></div>
+            <div class="pill" data-v="0.75">75% <span class="sub">баланс</span></div>
+            <div class="pill is-active" data-v="1">100% <span class="sub">макс</span></div>
           </div>
 
           <div class="warn-banner" id="warn-banner"></div>
@@ -1359,6 +1368,9 @@
         aspect: '9:16',
         strategy: 'uniform',   // uniform | random | manual
         manualMarkers: [],     // массив секунд
+        // r22: throttle FFmpeg/threads + WebCodecs latencyHint.
+        // 1.0 = max (по умолчанию), 0.75 = баланс, 0.5 = эко.
+        gpuLoad: 1.0,
         // субтитры
         subsEnabled: false,
         subsLang: 'auto',      // ru | en | auto
@@ -2713,6 +2725,9 @@
             // падает в 5-10x. С prefer-hardware выбирается GPU-путь
             // (MediaFoundation / VideoToolbox / VAAPI) если он доступен.
             hardwareAcceleration: 'prefer-hardware',
+            // r22: latencyHint зависит от gpuLoad (50% → 'power-efficient').
+            // 'quality' не подходит — мы хотим МЕНЬШЕ нагрузки, не больше.
+            latencyHint: getLatencyHint(),
             avc: { format: 'avc' }, // эмитить avcC (нужен для muxer)
           });
 
@@ -2727,6 +2742,8 @@
                 codec: codecString,
                 width, height, bitrate, framerate: 30,
                 hardwareAcceleration: 'prefer-hardware',
+                // r22: latencyHint управляется настройкой gpuLoad (50% → 'power-efficient')
+                latencyHint: getLatencyHint(),
                 avc: { format: 'avc' },
               });
               console.log('[vertcut] encoder support:', {
@@ -3070,7 +3087,7 @@
           ? [
               '-ss', String(start), '-i', inputName, '-t', String(dur),
               '-vf', 'scale=iw*max(1\\,ih*9/(iw*16)):ih:flags=lanczos,crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
-              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', `-threads`, String(getFFmpegThreads()),
               '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
               clipName,
             ]
@@ -3096,13 +3113,13 @@
           ? [
               '-i', inputName, '-ss', String(start), '-t', String(dur),
               '-vf', 'scale=iw*max(1\\,ih*9/(iw*16)):ih:flags=lanczos,crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920',
-              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', `-threads`, String(getFFmpegThreads()),
               '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
               clipName,
             ]
           : [
               '-i', inputName, '-ss', String(start), '-t', String(dur),
-              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+              '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', `-threads`, String(getFFmpegThreads()),
               '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart',
               clipName,
             ];
@@ -3216,6 +3233,16 @@
                 let tr;
                 try {
                   tr = await WhisperCore.transcribe(audio16, settings.subsLang);
+                  // r22: если gpuLoad < 1, даём CPU/GPU "продохнуть" между
+                  // клипами. Whisper (ONNX) не имеет API-ручки throttle,
+                  // поэтому — пауза. На 75% ждём 200мс, на 50% — 500мс.
+                  // Минимально влияет на общее время (5 клипов × 500мс
+                  // = 2.5с, vs минуты обработки), но снижает пиковую
+                  // нагрузку на слабых машинах.
+                  if (AppState.settings.gpuLoad < 1.0) {
+                    const pauseMs = AppState.settings.gpuLoad <= 0.5 ? 500 : 200;
+                    await new Promise((r) => setTimeout(r, pauseMs));
+                  }
                 } finally {
                   clearInterval(tick);
                 }
@@ -3270,7 +3297,7 @@
                       await FFmpegCore.run([
                         '-i', clipName,
                         '-vf', vf,
-                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28',
+                        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28', `-threads`, String(getFFmpegThreads()),
                         '-c:a', 'copy',
                         finalName,
                       ]);
@@ -3722,7 +3749,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r21 · src-restore', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r22 · gpu-throttle', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -4352,6 +4379,41 @@
         AppState.settings.clipLength = +t.dataset.v;
         updateClipsCountWarning();
       });
+
+      // r22: GPU-нагрузка. Web-платформа не даёт "GPU 50%" крутилку —
+      // браузер сам управляет GPU-процессом. Наш proxy-throttle:
+      //   1) FFmpeg.wasm: -threads N (N = floor(hwConc * gpuLoad))
+      //      libx264 в WASM — чистый CPU, дефолт юзает все ядра.
+      //      Режем потоки — меньше нагрев, медленнее рез.
+      //   2) WebCodecs VideoEncoder: latencyHint
+      //      'realtime' (100%) → 'realtime' (75%) → 'power-efficient' (50%)
+      //      hint не даёт точного %, но явно указывает браузеру
+      //      предпочесть экономию энергии качеству/скорости.
+      //   3) Whisper (ONNX): нет API-ручки. На 50% добавляем
+      //      искусственную паузу между чанками — снижает пиковую
+      //      нагрузку на CPU, хоть и удлиняет обработку.
+      const pillGpu = document.getElementById('pill-gpu');
+      pillGpu.addEventListener('click', (e) => {
+        const t = e.target.closest('.pill');
+        if (!t) return;
+        pillGpu.querySelectorAll('.pill').forEach((p) => p.classList.toggle('is-active', p === t));
+        AppState.settings.gpuLoad = +t.dataset.v;
+        console.log('[vertcut] gpuLoad:', AppState.settings.gpuLoad,
+          'ffmpeg-threads:', getFFmpegThreads(),
+          'latencyHint:', getLatencyHint());
+      });
+      function getFFmpegThreads() {
+        // navigator.hardwareConcurrency есть везде кроме file://
+        const hw = (typeof navigator !== 'undefined' && navigator.hardwareConcurrency) || 4;
+        const n = Math.max(1, Math.floor(hw * AppState.settings.gpuLoad));
+        return n;
+      }
+      function getLatencyHint() {
+        // 'power-efficient' для 50%, иначе 'realtime' (дефолт).
+        // 'quality' нам не подходит — мы НЕ хотим медленнее, мы хотим
+        // меньше GPU. Поэтому только два значения.
+        return AppState.settings.gpuLoad <= 0.5 ? 'power-efficient' : 'realtime';
+      }
 
       const sliderCount = document.getElementById('slider-count');
       const valCount = document.getElementById('val-count');
