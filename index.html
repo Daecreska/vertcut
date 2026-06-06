@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r23">
+<body data-build="vertcut-muxfix-2026-06-05-r24">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r23 · scope-fix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r24 · ort-fix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1318,6 +1318,26 @@
       _transformers = await import('https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2/dist/transformers.min.js');
       // Запретим попытки загрузки с локальной файловой системы
       _transformers.env.allowLocalModels = false;
+      // r24: фикс "RuntimeError: function signature mismatch" в dynCall.
+      // ort-web 1.17.1 (зашит в transformers.js 2.17.2) при crossOriginIsolated=true
+      // автоматически включает pthread-воркер через SAB. В этом режиме падает
+      // dynCall — известный баг microsoft/onnxruntime#14445.
+      // Наш coi-serviceworker делает crossOriginIsolated=true, поэтому баг
+      // гарантированно срабатывает. Лечится принудительным single-thread WASM.
+      // SIMD при этом оставляем — single-thread + SIMD быстрее, чем multi-thread
+      // без SIMD. Прокси-воркер тоже выключаем (он использует тот же SAB-механизм).
+      const ort = _transformers.env && _transformers.env.backends && _transformers.env.backends.onnx;
+      if (ort) {
+        if (ort.wasm) {
+          ort.wasm.numThreads = 1;
+          ort.wasm.proxy = false;
+          // ort.wasm.simd = true; // дефолт, не трогаем
+        }
+        // Глушим спам "[W:onnxruntime: graph.cc:3490 CleanUnusedInitializers…]".
+        // Эти варнинги безвредны (просто ort-web чистит неиспользуемые init-ноды
+        // Whisper-декодера), но засоряют консоль сотнями строк.
+        ort.logLevel = 'error';
+      }
       return _transformers;
     }
 
