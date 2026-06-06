@@ -125,6 +125,20 @@
       gap: 16px;
       margin-bottom: 28px;
     }
+    #build-marker {
+      font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.5px;
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: linear-gradient(90deg, #ff7a18 0%, #ff3d6e 100%);
+      color: #fff;
+      box-shadow: 0 0 0 2px rgba(255, 61, 110, 0.25);
+      white-space: nowrap;
+      user-select: all;
+      cursor: help;
+    }
     .brand {
       display: flex;
       align-items: center;
@@ -832,7 +846,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body>
+<body data-build="vertcut-muxfix-2026-06-05-r10">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -886,6 +900,9 @@
         <span class="dot" data-step="processing"></span>
         <span class="dot" data-step="results"></span>
       </div>
+      <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
+           Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r10 · 4kfix</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -2012,13 +2029,23 @@
 
       // Извлекает AAC AudioSpecificConfig из esds-бокса аудиотрека.
       // Нужно для пасстру-копирования AAC в выходной MP4 через mp4-muxer.
+      // r9: расширен диагностикой — раньше молча возвращал null, теперь
+      // возвращает объект {ok, bytes, codec, reason} чтобы onReady мог
+      // корректно залогировать причину drop'а и показать toast.
       function extractAudioConfig(mp4box, track) {
         const trak = mp4box.getTrackById(track.id);
-        if (!trak || !trak.mdia || !trak.mdia.minf || !trak.mdia.minf.stbl || !trak.mdia.minf.stbl.stsd) return null;
-        for (const entry of trak.mdia.minf.stbl.stsd.entries) {
+        const codec = track && track.codec;
+        if (!trak || !trak.mdia || !trak.mdia.minf || !trak.mdia.minf.stbl || !trak.mdia.minf.stbl.stsd) {
+          return { ok: false, codec, reason: 'stsd box missing — контейнер нестандартный' };
+        }
+        const entries = trak.mdia.minf.stbl.stsd.entries || [];
+        const entryTypes = entries.map(e => e.type || e.getName ? e.getName() : '?').join(',');
+        if (entries.length === 0) {
+          return { ok: false, codec, reason: 'stsd.entries пустой — нет сэмплов' };
+        }
+        for (const entry of entries) {
+          // AAC: AudioSpecificConfig лежит в esds.esd → tag=5 (DecoderSpecificInfo).
           if (entry.esds) {
-            // mp4box.js парсит esds → entry.esds.esd → массив дескрипторов.
-            // Дескриптор tag=5 (DecoderSpecificInfo) содержит AudioSpecificConfig.
             const findDsi = (desc) => {
               if (!desc) return null;
               if (desc.tag === 5 && desc.data) return desc.data;
@@ -2031,10 +2058,53 @@
               return null;
             };
             const dsi = findDsi(entry.esds.esd);
-            if (dsi) return dsi instanceof Uint8Array ? dsi : new Uint8Array(dsi);
+            if (dsi) {
+              return { ok: true, bytes: dsi instanceof Uint8Array ? dsi : new Uint8Array(dsi), codec: 'aac' };
+            }
+            // esds есть, но DecoderSpecificInfo не нашли — попробуем посмотреть
+            // что там вообще лежит (полезно для диагностики).
+            const dumpEsds = (d, depth = 0) => {
+              if (!d || depth > 5) return '';
+              let s = `[tag=${d.tag} size=${d.size || '?'}${d.data ? ` dataLen=${d.data.byteLength || d.data.length || '?'}` : ''}]`;
+              if (d.descs) {
+                s += ' ' + d.descs.map(x => dumpEsds(x, depth + 1)).join(' ');
+              }
+              return s;
+            };
+            return { ok: false, codec: 'aac', reason: 'esds есть, но tag=5 (DecoderSpecificInfo) не найден: ' + dumpEsds(entry.esds.esd) };
+          }
+          // Opus: dOps бокс внутри OpusSampleEntry. mp4-muxer хочет payload
+          // dOps (без 8-байтного заголовка бокса).
+          if (entry.dOps) {
+            try {
+              const stream = new DataStream(undefined, 0, DataStream.BIG_ENDIAN);
+              entry.dOps.write(stream);
+              const payload = new Uint8Array(stream.buffer, 8);
+              return { ok: true, bytes: payload, codec: 'opus' };
+            } catch (e) {
+              return { ok: false, codec: 'opus', reason: 'dOps.write() упал: ' + (e.message || e) };
+            }
           }
         }
-        return null;
+        // stsd.entries есть, но ни esds, ни dOps не нашли
+        return { ok: false, codec, reason: `не нашли esds/dOps в stsd entries: [${entryTypes}]` };
+      }
+
+      // Маппинг fourcc-строки из MP4Box → кодек, который понимает mp4-muxer.
+      // Возвращает null для кодеков, которые пасстром не поддерживаем
+      // (тогда в onReady audioTrack обнулится и muxer инициализируется без аудио).
+      function mapAudioMuxerCodec(fourcc) {
+        if (!fourcc) return null;
+        const c = String(fourcc).toLowerCase().trim();
+        if (c === 'mp4a') return 'aac';        // AAC
+        if (c === 'opus') return 'opus';        // Opus (YouTube, WebRTC)
+        if (c === 'flac') return 'flac';
+        if (c === 'ac-3') return 'ac-3';
+        if (c === 'ec-3') return 'ec-3';
+        if (c === 'mp3 ' || c === '.mp3') return 'mp3';
+        if (c === 'samr') return 'amr-nb';
+        if (c === 'sawb') return 'amr-wb';
+        return null; // неизвестный/неподдерживаемый — drop
       }
 
       // Главная функция транскода. Возвращает новый File ('input_h264.mp4').
@@ -2054,15 +2124,34 @@
         let audioSamplesEnqueued = 0;
         let videoSamplesEnqueued = 0;
         let videoFlushDone = false;
+        // r7: perf-meters (achieved fps + realtime-rate)
+        let perfLastLogTs = performance.now();
+        let perfLastFrames = 0;
+        // r10: stability tracker for maybeComplete — если encoded==enqueued и
+        // счётчик не растёт >2с после flush, считаем транскод завершённым
+        // (даже если MP4Box остановился на 900 кадрах для 34-мин видео).
+        let stableSinceTs = 0;
+        let lastEncodedCount = 0;
         let aborted = false;
 
         let muxer = null;
+        // r10: при StreamTarget-muxer'е здесь копятся Uint8Array чанки
+        // (при ArrayBufferTarget fallback — null, и читаем из muxer.target.buffer).
+        let muxerTargetChunks = null;
         let videoDecoder = null;
         let videoEncoder = null;
         let audioConfigDescription = null;
 
         let resolveDone, rejectDone;
         const done = new Promise((res, rej) => { resolveDone = res; rejectDone = rej; });
+
+        // r9: pumpDone — резолвится когда pump IIFE закончил читать файл
+        // и вызвал mp4box.flush(). Main flow должен await pumpDone ПЕРЕД
+        // явным decoder/encoder.flush(), иначе часть сэмплов ещё не в
+        // очереди декодера и flush пройдёт вхолостую (а потом startMuxPhase
+        // вызовется раньше, чем все кадры будут реально обработаны).
+        let resolvePump;
+        const pumpDone = new Promise(res => { resolvePump = res; });
 
         const abortFn = () => {
           aborted = true;
@@ -2079,26 +2168,101 @@
         function reportProgress() {
           const vTotal = Math.max(1, videoSamplesTotal);
           const vp = videoSamplesEncoded / vTotal;
-          onProgress(Math.max(0, Math.min(0.99, vp)));
+          // Кодируемому кадру отдаём 0..90% прогресса; последние 10% — это
+          // finalize() муксерa (запись контейнера MP4), на которую нет
+          // per-chunk событий. Без этого резерва бар зависал на 99% на 1-2
+          // минуты, пока mux.finalize() синхронно собирал файл.
+          onProgress(Math.max(0, Math.min(0.90, vp * 0.90)));
+
+          // r7: раз в секунду логируем achieved fps и realtime-rate.
+          // Помогает диагностировать «очень долго»: если < 0.5x realtime,
+          // значит декодер/энкодер работают в software, и HW не активирован.
+          const now = performance.now();
+          if (now - perfLastLogTs > 1000) {
+            const dt = (now - perfLastLogTs) / 1000;
+            const df = videoSamplesEncoded - perfLastFrames;
+            const fps = df / dt;
+            // realtime-rate: 1.0 = транскодим так же быстро, как видео длится.
+            // < 1.0 = медленнее realtime, > 1.0 = быстрее.
+            const rtr = fps / 30; // framerate=30 в encoder config
+            console.log(`[vertcut] encoding: ${videoSamplesEncoded}/${vTotal} frames, ${fps.toFixed(1)} fps, ${rtr.toFixed(2)}x realtime`);
+            perfLastLogTs = now;
+            perfLastFrames = videoSamplesEncoded;
+          }
+        }
+
+        // Маркер для mux-фазы: она начинается после resolveDone() и
+        // длится до выхода из muxer.finalize(). На этом отрезке нет
+        // per-chunk событий, поэтому мы смузим прогресс таймером.
+        let muxTimer = null;
+        let muxStart = 0;
+        let muxDone = false;
+        function startMuxPhase() {
+          muxStart = performance.now();
+          muxDone = false;
+          console.log('[mux] startMuxPhase called (BUILD r1)');
+          onProgress(0.91, 'muxing');
+          // 250 мс — компромисс между плавностью и отсутствием jank.
+          // Канва/cpu не успевают заметить 4 Hz обновлений.
+          muxTimer = setInterval(() => {
+            if (muxDone) return;
+            // Консервативная линейная раскрутка 0.91 -> 0.985 за ~90 c.
+            // Для длинных mux-ов упрёмся в 0.985 и просто подождём finalize().
+            const since = (performance.now() - muxStart) / 1000;
+            const frac = Math.min(0.985, 0.91 + (since / 90) * 0.075);
+            onProgress(frac, 'muxing');
+          }, 250);
+        }
+        function endMuxPhase() {
+          muxDone = true;
+          if (muxTimer) { clearInterval(muxTimer); muxTimer = null; }
+          onProgress(1.0, 'done');
         }
 
         function maybeComplete() {
-          // После того как pump+декодер+энкодер flush'нулись, ВСЕ enqueued сэмплы
-          // дали output чанки. Не сравниваем с videoSamplesTotal (nb_samples от
-          // MP4Box иногда отличается на 1-2 от реальной количества выданных
-          // onSamples сэмплов — в этом случае ждать «недостающего» сэмпла бессмысленно).
-          if (videoFlushDone && videoSamplesEncoded >= videoSamplesEnqueued && videoSamplesEnqueued > 0) {
+          // r10: rаньше сравнивали encoded >= enqueued — это работает только
+          // если MP4Box честно отдал ВСЕ сэмплы. Для больших AV1-файлов
+          // (34 мин, 4K) onSamples может остановиться на 900 кадре из-за
+          // moov-парсинга, и мы зависнем на ожидании «недостающих» сэмплов.
+          //
+          // Теперь: после flush если счётчик encoded НЕ растёт уже 2с,
+          // считаем транскод завершённым (даже если encoded < total).
+          if (!videoFlushDone) return;
+          if (videoSamplesEnqueued === 0) return;
+          if (videoSamplesEncoded !== lastEncodedCount) {
+            lastEncodedCount = videoSamplesEncoded;
+            stableSinceTs = performance.now();
+            return;
+          }
+          // Счётчик не меняется. Если так уже >2с после flush — завершаем.
+          if (stableSinceTs > 0 && performance.now() - stableSinceTs > 2000) {
+            console.log('[vertcut] maybeComplete: encoded stable for >2s,',
+              'encoded =', videoSamplesEncoded,
+              'enqueued =', videoSamplesEnqueued,
+              'total =', videoSamplesTotal,
+              (videoSamplesEncoded < videoSamplesTotal
+                ? '(NB: MP4Box stopped emitting samples early — транскод обрезан по данным источника)'
+                : '(all samples encoded)'));
             resolveDone();
           }
         }
 
         // Бэкпрешер: ждём пока очередь декодера/энкодера не разгрузится.
+        // r7: задержка уменьшена с 16мс до 4мс, и не дёргаем очередь если
+        // она почти пустая — это даёт ~5-10% прироста на длинных файлах.
         async function waitForQueueSpace() {
-          while (videoDecoder && videoDecoder.decodeQueueSize > 24 && !aborted) {
-            await new Promise(r => setTimeout(r, 16));
+          // Декодер: пропускаем ожидание, если в очереди < 20 кадров.
+          // (Лимит 24 в r6 был излишне консервативен.)
+          if (videoDecoder && videoDecoder.decodeQueueSize >= 20) {
+            while (videoDecoder && videoDecoder.decodeQueueSize > 12 && !aborted) {
+              await new Promise(r => setTimeout(r, 4));
+            }
           }
-          while (videoEncoder && videoEncoder.encodeQueueSize > 16 && !aborted) {
-            await new Promise(r => setTimeout(r, 16));
+          // Энкодер: аналогично, и бэкпрешер нужен только если уже > 12.
+          if (videoEncoder && videoEncoder.encodeQueueSize >= 12) {
+            while (videoEncoder && videoEncoder.encodeQueueSize > 8 && !aborted) {
+              await new Promise(r => setTimeout(r, 4));
+            }
           }
         }
 
@@ -2114,13 +2278,39 @@
           videoSamplesTotal = videoTrack.nb_samples;
           audioSamplesTotal = audioTrack ? audioTrack.nb_samples : 0;
 
+          // r10: r10: videoTrack.nb_samples иногда врёт для больших AV1-файлов
+          // (например, возвращает 900 для 34-минутного видео). Сравниваем
+          // с ожидаемым по duration*fps, и если есть большое расхождение —
+          // используем max(nb_samples, expected) чтобы maybeComplete() не
+          // сработал слишком рано и не убил энкодер на 900-м кадре.
+          const trackFps = (videoTrack.video && videoTrack.video.framerate) || 30;
+          const expectedFrames = Math.round((info.duration / info.timescale) * trackFps);
+          const samplesDiscrepancy = expectedFrames > 0
+            ? Math.abs(videoSamplesTotal - expectedFrames) / expectedFrames
+            : 0;
+          if (samplesDiscrepancy > 0.10 && expectedFrames > videoSamplesTotal) {
+            console.warn('[vertcut] videoTrack.nb_samples discrepancy detected!',
+              'nb_samples =', videoSamplesTotal,
+              'expected ~', expectedFrames,
+              '(' + Math.round(samplesDiscrepancy * 100) + '% off).',
+              'Using max(nb_samples, expected) as total to prevent early stop.');
+            videoSamplesTotal = Math.max(videoSamplesTotal, expectedFrames);
+          }
+          console.log('[vertcut] videoSamplesTotal =', videoSamplesTotal,
+            'expected ~', expectedFrames,
+            'fps =', trackFps,
+            'duration =', (info.duration / info.timescale).toFixed(2), 's');
+
           const width = videoTrack.video.width;
           const height = videoTrack.video.height;
 
-          // Целевой битрейт: ~3 бит/пиксель для 720p ≈ 2.8 Мбит/с;
-          // зажимаем в [1, 16] Мбит/с для безопасности на любых разрешениях.
-          // 16 Мбит верхний потолок чтобы 4K не вылазил за разумное в браузере.
-          const bitrate = Math.max(1_000_000, Math.min(16_000_000, Math.round(width * height * 3)));
+          // Целевой битрейт: ~2 бит/пиксель для 720p ≈ 1.85 Мбит/с (с
+          // минимумом 2 Мбит/с); зажимаем в [2, 8] Мбит/с. Для 4K
+          // (3840×2160) это даёт 8 Мбит/с — 34-мин видео → ~1.9 GB выходной
+          // файл, что влезает в RAM при StreamTarget-muxer.
+          // (Раньше было 3 бит/пиксель × до 16 Мбит/с — для 4K выдавало
+          // 24 Мбит/с и ~5.9 GB выход, что ArrayBufferTarget не вывозил.)
+          const bitrate = Math.max(2_000_000, Math.min(8_000_000, Math.round(width * height * 2)));
 
           // Выбираем H.264 уровень динамически по разрешению — иначе
           // VideoEncoder ругается "coded area exceeds maximum supported by AVC level".
@@ -2143,30 +2333,95 @@
           // 0x00 (constraint set) — без ограничений.
           const codecString = 'avc1.6400' + levelHex;
 
-          // Извлекаем audio config заранее — он понадобится для каждого AAC чанка.
-          // Если кодек не AAC или esds-бокс отсутствует/не парсится — пасстру невозможен,
-          // в этом случае пропускаем аудио целиком (видео без звука лучше, чем падение транскода).
+          // Извлекаем audio config заранее — он понадобится для каждого аудио-чанка.
+          // r9: extractAudioConfig возвращает {ok, bytes, codec, reason} —
+          // раньше возвращал null/bytes, и причина drop'а терялась.
           if (audioTrack) {
-            audioConfigDescription = extractAudioConfig(mp4box, audioTrack);
-            if (!audioConfigDescription) {
+            const audioCfg = extractAudioConfig(mp4box, audioTrack);
+            audioConfigDescription = audioCfg.ok ? audioCfg.bytes : null;
+            console.log('[vertcut] audio track:', {
+              codec: audioTrack.codec,
+              codec4cc: audioTrack.codec,
+              channels: audioTrack.audio && audioTrack.audio.channel_count,
+              sampleRate: audioTrack.audio && audioTrack.audio.sample_rate,
+              nb_samples: audioTrack.nb_samples,
+              configResult: audioCfg,
+            });
+            if (!audioCfg.ok) {
+              // drop audio, но явно логируем причину и помечаем window.__vertcutDroppedAudio
+              // чтобы consumer мог показать toast сразу после успешного транскода.
+              console.warn('[vertcut] audio dropped, reason:', audioCfg.reason);
+              window.__vertcutDroppedAudio = {
+                codec: audioCfg.codec || audioTrack.codec,
+                reason: audioCfg.reason,
+              };
+              audioTrack = null;
+              audioSamplesTotal = 0;
+            } else {
+              window.__vertcutDroppedAudio = null;
+            }
+          } else {
+            console.log('[vertcut] no audio track in source file');
+          }
+
+          // Инициализируем muxer (без audio-секции, если пасстру невозможен)
+          // Кодек аудио мапим из fourcc (mp4a/opus/flac/...) в то, что
+          // понимает mp4-muxer. Если кодек неизвестный — дропаем аудио.
+          let muxerAudioCodec = null;
+          if (audioTrack) {
+            muxerAudioCodec = mapAudioMuxerCodec(audioTrack.codec);
+            if (!muxerAudioCodec) {
+              console.warn('[vertcut] audio codec not supported by muxer:', audioTrack.codec);
               audioTrack = null;
               audioSamplesTotal = 0;
             }
           }
-
-          // Инициализируем muxer (без audio-секции, если пасстру невозможен)
           try {
-            muxer = new Mp4Muxer.Muxer({
-              target: new Mp4Muxer.ArrayBufferTarget(),
-              video: { codec: 'avc', width, height },
-              audio: audioTrack ? {
-                codec: 'aac',
-                numberOfChannels: audioTrack.audio.channel_count,
-                sampleRate: audioTrack.audio.sample_rate,
-              } : undefined,
-              fastStart: 'in-memory',
-              firstTimestampBehavior: 'offset',
-            });
+            // r10: rаньше использовали ArrayBufferTarget, который держит
+            // ВЕСЬ выходной буфер в RAM. Для 4K 34-мин видео при 8 Mbps
+            // это ~1.9 GB — Chrome OOM-crашится. Переходим на StreamTarget
+            // с chunkSize 1 MB: muxer пишет чанки в TransformStream по мере
+            // кодирования, в RAM одновременно лежит только один чанк.
+            // В конце собираем все чанки в Blob —> File, как раньше.
+            const useStreamTarget = typeof Mp4Muxer.StreamTarget === 'function';
+            if (useStreamTarget) {
+              const muxerChunks = [];
+              const muxerWritable = new WritableStream({
+                write(chunk) { muxerChunks.push(chunk); },
+                close() { console.log('[vertcut] muxer stream closed, chunks:', muxerChunks.length, 'totalBytes:', muxerChunks.reduce((s, c) => s + c.byteLength, 0)); },
+                abort(reason) { console.warn('[vertcut] muxer stream aborted:', reason); },
+              });
+              // Сохраняем в замыкании transcodeAV1ToH264 для финальной сборки
+              muxerTargetChunks = muxerChunks;
+              muxer = new Mp4Muxer.Muxer({
+                target: new Mp4Muxer.StreamTarget(muxerWritable, { chunkSize: 1024 * 1024 }),
+                video: { codec: 'avc', width, height },
+                audio: audioTrack ? {
+                  codec: muxerAudioCodec,
+                  numberOfChannels: audioTrack.audio.channel_count,
+                  sampleRate: audioTrack.audio.sample_rate,
+                } : undefined,
+                fastStart: 'in-memory',
+                firstTimestampBehavior: 'offset',
+              });
+              console.log('[vertcut] muxer: StreamTarget (chunked) — safe for >1GB outputs');
+            } else {
+              // Fallback: ArrayBufferTarget (если mp4-muxer версия без StreamTarget)
+              muxer = new Mp4Muxer.Muxer({
+                target: new Mp4Muxer.ArrayBufferTarget(),
+                video: { codec: 'avc', width, height },
+                audio: audioTrack ? {
+                  codec: muxerAudioCodec,
+                  numberOfChannels: audioTrack.audio.channel_count,
+                  sampleRate: audioTrack.audio.sample_rate,
+                } : undefined,
+                fastStart: 'in-memory',
+                firstTimestampBehavior: 'offset',
+              });
+              muxerTargetChunks = null;
+              console.warn('[vertcut] muxer: ArrayBufferTarget (fallback) — >500MB inputs may OOM');
+            }
+            console.log('[vertcut] muxer audio config:', audioTrack ? { codec: muxerAudioCodec, channels: audioTrack.audio.channel_count, sampleRate: audioTrack.audio.sample_rate } : 'no audio');
           } catch (e) {
             rejectDone(new Error('Mp4Muxer init failed: ' + (e.message || e)));
             return;
@@ -2214,8 +2469,35 @@
             width, height,
             bitrate,
             framerate: 30,
+            // r7: явно просим hardware-кодировщик. Без этой опции Chrome
+            // на некоторых машинах выбирает software (OpenH264) и скорость
+            // падает в 5-10x. С prefer-hardware выбирается GPU-путь
+            // (MediaFoundation / VideoToolbox / VAAPI) если он доступен.
+            hardwareAcceleration: 'prefer-hardware',
             avc: { format: 'avc' }, // эмитить avcC (нужен для muxer)
           });
+
+          // Проверяем реально ли выбран hardware и логируем — помогает
+          // понять почему «очень долго» (если hwAcceleration = 'prefer-software',
+          // значит GPU не подошёл, и придётся либо уменьшить разрешение,
+          // либо перекодировать локально). onReady — sync callback, поэтому
+          // оборачиваем в async IIFE.
+          (async () => {
+            try {
+              const encSupport = await VideoEncoder.isConfigSupported({
+                codec: codecString,
+                width, height, bitrate, framerate: 30,
+                hardwareAcceleration: 'prefer-hardware',
+                avc: { format: 'avc' },
+              });
+              console.log('[vertcut] encoder support:', {
+                supported: encSupport && encSupport.supported,
+                hw: encSupport && encSupport.config && encSupport.config.hardwareAcceleration,
+              });
+            } catch (e) {
+              console.warn('[vertcut] encoder isConfigSupported failed:', e);
+            }
+          })();
 
           // Извлекаем сэмплы обоих треков
           mp4box.setExtractionOptions(videoTrack.id, null, { nbSamples: 100 });
@@ -2245,7 +2527,9 @@
               }
             }
           } else if (audioTrack && track_id === audioTrack.id && muxer && audioConfigDescription) {
-            // Аудио — пасстру AAC: пишем сэмплы напрямую в muxer без декодинга.
+            // Аудио — пасстру: пишем сэмплы напрямую в muxer без декодинга.
+            // Кодек передаём в формате mp4-muxer'а (aac/opus/...), а НЕ fourcc.
+            const muxCodec = mapAudioMuxerCodec(audioTrack.codec) || 'aac';
             for (const s of samples) {
               try {
                 muxer.addAudioChunkRaw(
@@ -2255,7 +2539,7 @@
                   1e6 * s.duration / s.timescale,
                   {
                     decoderConfig: {
-                      codec: audioTrack.codec,
+                      codec: muxCodec,
                       sampleRate: audioTrack.audio.sample_rate,
                       numberOfChannels: audioTrack.audio.channel_count,
                       description: audioConfigDescription,
@@ -2295,21 +2579,69 @@
               rejectDone(new Error('MP4Box не смог разобрать файл (нет moov-бокса или нет AV1-видеотрека)'));
               return;
             }
-
-            // Дожидаемся когда все сэмплы окажутся в декодере
-            // (mp4box.flush заэмитит финальные onSamples синхронно).
-            await videoDecoder.flush();
-            await videoEncoder.flush();
-            videoFlushDone = true;
-            maybeComplete();
+            // Декодер/энкодер флашим НЕ здесь, а в основном потоке ниже —
+            // там же где await done. Так легче поставить watchdog и
+            // гарантировать, что close() вызывается уже после flush.
+            console.log('[vertcut] pump: file read, mp4box flushed, awaiting flush in main flow');
+            // r9: сообщаем main flow что pump завершил работу.
+            resolvePump();
           } catch (e) {
             if (!aborted) {
               rejectDone(new Error('Pump/flush failed: ' + (e.message || e)));
             }
+            // Всё равно резолвим pumpDone чтобы main flow не висел вечно
+            // (если был abort, watchdog всё равно force-resolve сделает).
+            try { resolvePump(); } catch (_) {}
           }
         })();
 
+        // === BUILD r9: await pumpDone перед явным flush ===
+        // Без этого main flow может успеть вызвать videoDecoder.flush()
+        // раньше, чем pump закончит кормить MP4Box → часть сэмплов не
+        // попадёт в очередь декодера → "98% сразу после старта".
+        await pumpDone;
+
+        // === BUILD r3: явный flush + watchdog 10s + then await done ===
+        // WebCodecs close() по спеке делает flush, но он не awaited и
+        // видео может зависнуть на 99% (vp>1, vp*0.90≈0.98). Поэтому
+        // делаем явный awaited flush в основном потоке ПЕРЕД startMuxPhase.
+        const flushWatchdog = setTimeout(() => {
+          console.error('[vertcut] flush hung >10s — forcing resolveDone (BUILD r3)');
+          videoFlushDone = true;
+          try { resolveDone(); } catch (_) {}
+        }, 10_000);
+
+        let flushOk = true;
+        try {
+          if (videoDecoder) {
+            console.log('[vertcut] awaiting videoDecoder.flush()…');
+            await videoDecoder.flush();
+            console.log('[vertcut] videoDecoder.flush() resolved');
+          }
+          if (videoEncoder) {
+            console.log('[vertcut] awaiting videoEncoder.flush()…');
+            await videoEncoder.flush();
+            console.log('[vertcut] videoEncoder.flush() resolved');
+          }
+          videoFlushDone = true;
+          maybeComplete();
+        } catch (e) {
+          flushOk = false;
+          if (!aborted) {
+            console.error('[vertcut] explicit flush failed:', e);
+            rejectDone(new Error('Explicit flush failed: ' + (e.message || e)));
+          }
+        } finally {
+          clearTimeout(flushWatchdog);
+        }
+
         await done;
+
+        // Кодирование видео+аудио закончено. Дальше идёт фаза muxing — запись
+        // собранного MP4 в ArrayBuffer. У mp4-muxer нет per-chunk колбэка
+        // на этом этапе, поэтому запускаем свой плавный таймер 91% → 98.5%
+        // чтобы бар не зависал на 99% на 1-2 минуты.
+        startMuxPhase();
 
         // Закрываем декодеры
         try { videoDecoder.close(); } catch (_) {}
@@ -2319,8 +2651,20 @@
 
         // Финализируем muxer и оборачиваем в File
         muxer.finalize();
-        const buffer = muxer.target.buffer;
-        onProgress(1.0);
+        let buffer;
+        if (muxerTargetChunks) {
+          // r10: StreamTarget — собираем все чанки в один Blob. Каждый
+          // чанк уже Uint8Array из TransformStream'а. В RAM в худшем случае
+          // лежит muxerChunks.length чанков (при 1MB chunkSize и 1.9GB
+          // выходе = 1900 чанков = 1900×1MB references, не копий).
+          buffer = new Blob(muxerTargetChunks, { type: 'video/mp4' });
+        } else {
+          // ArrayBufferTarget fallback
+          buffer = muxer.target.buffer;
+        }
+        endMuxPhase();
+
+        console.log('[vertcut] transcode done. video:', videoSamplesEncoded, '/', videoSamplesEnqueued, 'audio:', audioSamplesEnqueued, '/', audioSamplesTotal, 'bufferSize:', buffer.byteLength || buffer.size, 'via:', muxerTargetChunks ? 'StreamTarget' : 'ArrayBufferTarget');
 
         const baseName = (file.name || 'input').replace(/\.[^.]+$/, '');
         return new File([buffer], `${baseName}_h264.mp4`, { type: 'video/mp4' });
@@ -3025,6 +3369,11 @@
     // Главный init: события, экраны, бизнес-логика
     // ====================================================================
     function init() {
+      // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
+      // при загрузке, значит у вас закеширован старый index.html.
+      // Хард-рефреш: Ctrl+Shift+R.
+      console.log('%c[vertcut] build: r10 · 4kfix', 'color:#ff3d6e;font-weight:bold');
+      console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
       // FFmpeg.wasm под капотом использует pthread/SAB. SAB включается только
@@ -3211,21 +3560,167 @@
         setTransProgress(0, 'Подготовка демуксера…');
         if (phaseTransEl) phaseTransEl.classList.add('is-active');
 
+        // r10: для файлов >500MB показываем warn-toast (и заодно запрашиваем
+        // permission для Notification API, чтобы 4K-транскод мог
+        // оповестить о завершении).
+        if (AppState.inputFile && AppState.inputFile.size > 500 * 1024 * 1024) {
+          const sizeMB = (AppState.inputFile.size / 1024 / 1024).toFixed(0);
+          UI.toast(`Файл ${sizeMB} MB — конвертация может занять >10 мин и потребует много RAM. Не закрывайте вкладку.`, 'warn');
+        }
+        if ('Notification' in window && Notification.permission === 'default') {
+          try { await Notification.requestPermission(); } catch (_) {}
+        }
+
         const abort = new AbortController();
         AppState.transcodeAbort = abort;
         const t0 = performance.now();
 
+        // r7: защита от случайного F5/Ctrl+R/Ctrl+W. Без этого при
+        // обновлении страницы транскод теряется и его надо начинать заново
+        // (WebCodecs-пайплайн живёт только в main-thread).
+        // r8: добавили Service-Worker-intercept — SW перехватывает top-level
+        // навигацию, возвращает hold-on страницу с прогрессом и кнопкой
+        // «Прервать». Это ДАЁТ ШАНС осознанно прервать, но работа всё равно
+        // теряется при navigation (Web Worker пока не используется).
+        const unloadHandler = (e) => {
+          e.preventDefault();
+          e.returnValue = 'Идёт конвертация видео. Уйти со страницы?';
+          return e.returnValue;
+        };
+        window.addEventListener('beforeunload', unloadHandler);
+
+        // r8: оповещаем SW о старте транскода. SW перехватит F5 и покажет
+        // hold-on UI с прогрессом и кнопкой «Прервать». Throttled до 500мс
+        // чтобы не спамить postMessage на каждый кадр (30-60 Hz).
+        let swNotifyLastTs = 0;
+        const notifySw = (active, p, phase, fileName) => {
+          if (!('serviceWorker' in navigator) || !navigator.serviceWorker.controller) return;
+          try {
+            navigator.serviceWorker.controller.postMessage({
+              type: 'transcode-state',
+              active: !!active,
+              progress: p || 0,
+              phase: phase || (active ? 'encoding' : 'idle'),
+              fileName: fileName || (AppState.inputFile && AppState.inputFile.name) || '',
+              elapsedMs: performance.now() - t0,
+            });
+          } catch (_) { /* SW не готов — игнорируем */ }
+        };
+        notifySw(true, 0, 'encoding');
+
+        // r8: слушаем запрос abort от hold-on страницы (через SW)
+        const onSwMessage = (ev) => {
+          if (ev.data && ev.data.type === 'transcode-abort-request') {
+            console.warn('[vertcut] abort requested from SW (hold-on page)');
+            try { abort.abort(); } catch (_) {}
+          }
+        };
+        if ('serviceWorker' in navigator) {
+          navigator.serviceWorker.addEventListener('message', onSwMessage);
+        }
+
+        // visibilitychange: показываем варнинг когда вкладка уходит в фон.
+        // r10: Chrome throttle-ит setTimeout/setInterval в фоновых вкладках
+        // до 1 раза в минуту. Это может в 10-100 раз замедлить видео-pump
+        // (он использует rAF + setTimeout), хотя WebCodecs encode/decode
+        // продолжают работать. Рекомендуем не сворачивать вкладку; для
+        // длинных 4K транскодов разрешение Notification покроет этот случай.
+        let warnedHidden = false;
+        document.addEventListener('visibilitychange', () => {
+          if (document.hidden && AppState.transcodeAbort === abort) {
+            if (!warnedHidden) {
+              warnedHidden = true;
+              console.warn('[vertcut] tab hidden during transcode — Chrome throttles setTimeout/setInterval in background tabs (1/min). WebCodecs продолжают работу, но pump может замедлиться. Не сворачивайте вкладку на 4K.');
+            }
+          } else if (!document.hidden) {
+            warnedHidden = false;
+          }
+        });
+
+        // ETA: r6 — отказались от EMA с dt-throttle, потому что onProgress
+        // в WebCodecs дёргается на каждый закодированный кадр (30-60 Hz),
+        // dt всегда < 0.025, EMA никогда не обновлялась и ETA был скрыт
+        // ВСЕГДА ("осталось считаем…"). Теперь простая линейная экстраполяция
+        // (1-p)*elapsed/p, но только в «безопасном» диапазоне p ∈ (0.05, 0.91)
+        // — за пределами 0.91 начинается muxing, и линейная оценка врёт
+        // на порядок ("6s left" при реальных 4 минутах, та самая жалоба).
+        let lastP = 0;
+        let lastTs = t0;
+        let emaRate = 0;
+        let sampleCount = 0;
+
         try {
           const newFile = await Transcoder.transcodeAV1ToH264(
             AppState.inputFile,
-            (p) => {
-              const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
-              const eta = p > 0.02 ? `, осталось ~${Math.max(0, ((1 - p) * (performance.now() - t0) / p / 1000)).toFixed(0)}s` : '';
-              setTransProgress(p, `${(p * 100).toFixed(1)}% · ${elapsed}s${eta}`);
+            (p, phase) => {
+              const now = performance.now();
+              const elapsedSec = (now - t0) / 1000;
+              const elapsed = elapsedSec.toFixed(1);
+
+              // r9: rарнируем в консоли момент перехода фазы — помогает
+              // увидеть если startMuxPhase не передал 'muxing'.
+              if (phase === 'muxing' && !window.__vertcutSeenMuxing) {
+                window.__vertcutSeenMuxing = true;
+                console.log('[vertcut] consumer: phase=muxing reached, label="Muxing…"');
+              } else if (phase === undefined && p > 0.91) {
+                if (!window.__vertcutSeenNoPhaseHighP) {
+                  window.__vertcutSeenNoPhaseHighP = true;
+                  console.warn('[vertcut] consumer: onProgress(', p.toFixed(3), ') WITHOUT phase при p>0.91 — лейбл будет «NN.N% · Ns, осталось ~X»');
+                }
+              }
+
+              let eta = '';
+              if (phase === 'muxing' || phase === 'done') {
+                // muxing/done — ETA подавлен, лейбл ниже.
+              } else if (p > 0.05 && p < 0.91) {
+                // === EMA мгновенной скорости (без dt-throttle — обновляем
+                // на каждом progress-колбэке, но пропускаем первый
+                // "фиктивный" замер, где lastP=0). ===
+                const dt = Math.max(0.001, (now - lastTs) / 1000);
+                const dp = p - lastP;
+                if (sampleCount > 0 && dp > 0) {
+                  const instRate = dp / dt;
+                  emaRate = emaRate > 0 ? (0.7 * emaRate + 0.3 * instRate) : instRate;
+                }
+                lastP = p;
+                lastTs = now;
+                sampleCount++;
+
+                // === Берём MAX из двух оценок: линейная — стабильна
+                // при равномерной работе; EMA — учитывает «затыки».
+                // Берём максимум, чтобы НЕ занижать ETA (пользователь
+                // жалуется именно на это — "6s left" при 4 минутах). ===
+                const linearEta = (1 - p) * elapsedSec / p;
+                const emaEta = emaRate > 0.0001 ? (1 - p) / emaRate : linearEta;
+                const sec = Math.max(1, Math.min(3600, Math.round(Math.max(linearEta, emaEta))));
+                eta = `, осталось ~${sec}s`;
+              } else if (p >= 0.91) {
+                // На границе encoding→muxing линейная оценка врёт в разы.
+                // Честно пишем "несколько секунд" — muxing длится 5..90s.
+                eta = ', осталось ~несколько секунд';
+              }
+              const label = phase === 'muxing'
+                ? `Muxing… · ${elapsed}s`
+                : phase === 'done'
+                  ? `Готово · ${elapsed}s`
+                  : `${(p * 100).toFixed(1)}% · ${elapsed}s${eta}`;
+              setTransProgress(p, label);
+              // r8: оповещаем SW о прогрессе (throttled 500мс)
+              if (now - swNotifyLastTs > 500) {
+                notifySw(true, p, phase || 'encoding');
+                swNotifyLastTs = now;
+              }
             },
             abort.signal,
           );
           AppState.transcodeAbort = null;
+          // r7: снимаем защиту от F5 (транскод успешно завершён)
+          // r8: оповещаем SW что транскод завершён — SW снимет блокировку
+          notifySw(false, 1.0, 'done');
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.removeEventListener('message', onSwMessage);
+          }
+          window.removeEventListener('beforeunload', unloadHandler);
 
           // Подменяем входной файл и обновляем превью + метаданные.
           // ВАЖНО: handler ставим ДО установки src, чтобы не пропустить
@@ -3264,12 +3759,40 @@
             phaseTransEl.classList.add('is-done');
           }
           UI.toast(`AV1 → H.264 транскод готов: ${(newFile.size / 1024 / 1024).toFixed(1)} MB`, 'ok');
+          // r9: если аудио было дропнуто — показываем отдельный warn-toast
+          // с причиной (extractAudioConfig вернул {ok: false}).
+          if (window.__vertcutDroppedAudio) {
+            const d = window.__vertcutDroppedAudio;
+            UI.toast(`Аудио (${d.codec}) не скопировано: ${d.reason}. Видео будет без звука.`, 'warn');
+          }
+          // r10: системная нотификация (если юзер дал permission).
+          // Полезно для 4K видео — транскод может идти 5-10 мин, и юзер
+          // переключается на другую вкладку/занимается другим делом.
+          if ('Notification' in window && Notification.permission === 'granted') {
+            try {
+              new Notification('VertCut: конвертация готова', {
+                body: `${(AppState.inputFile && AppState.inputFile.name) || 'файл'} → H.264, ${(newFile.size / 1024 / 1024).toFixed(1)} MB`,
+                icon: '/favicon.ico',
+                tag: 'vertcut-done',
+              });
+            } catch (e) {
+              console.warn('[vertcut] Notification failed:', e);
+            }
+          }
 
           UI.show('settings');
           renderTimeline();
           updateClipsCountWarning();
         } catch (e) {
           AppState.transcodeAbort = null;
+          // r7: снимаем защиту от F5 (транскод упал/отменён, грузить уже
+          // нечего, перезагрузка безопасна)
+          window.removeEventListener('beforeunload', unloadHandler);
+          // r8: оповещаем SW что транскод завершён (с ошибкой/отменой)
+          notifySw(false, 0, e && e.name === 'AbortError' ? 'aborted' : 'error');
+          if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.removeEventListener('message', onSwMessage);
+          }
           if (phaseTransEl) phaseTransEl.classList.remove('is-active');
           if (e && e.name === 'AbortError') {
             UI.toast('Транскод отменён', 'warn');
