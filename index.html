@@ -847,7 +847,7 @@
     .color-pair input.input { width: 90px; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
   </style>
 </head>
-<body data-build="vertcut-muxfix-2026-06-05-r11">
+<body data-build="vertcut-muxfix-2026-06-05-r12">
   <!-- =====================================================================
        FALLBACK
        ===================================================================== -->
@@ -903,7 +903,7 @@
       </div>
       <!-- Build marker: если вы его НЕ видите в UI — у вас закеширован старый index.html.
            Сделайте жёсткий рефреш (Ctrl+Shift+R) или откройте в режиме инкогнито. -->
-      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r11 · auditfix</div>
+      <div id="build-marker" title="Если видите — патч загружен. Если нет — кеш.">BUILD r12 · auditfix2</div>
     </header>
 
     <!-- ================ ЭКРАН 1: ЗАГРУЗКА ================ -->
@@ -1349,6 +1349,7 @@
       inputFFmpegName: null,  // r11: имя входного файла в FFmpeg FS (input.mp4 / input.webm / ...),
                               // нужно чтобы cleanupBlobs() удалял именно его, а не только input.mp4
       transcodeAbort: null,   // AbortController, активный при идущем AV1→H.264 транскоде
+      transcodingInProgress: false, // r12: reentrancy-guard для «Далее» (см. maybeTranscodeThenSettings)
 
       // Настройки нарезки
       settings: {
@@ -1569,7 +1570,14 @@
             if (onProgress) onProgress(Math.min(0.99, loaded / total));
           }
           const blob = new Blob(chunks);
-          await IDBCache.put(key, blob);
+          // r12: IDBCache.put может бросить (QuotaExceededError на маленьком
+          // квоте браузера, или SecurityError в private mode). IDBCache сам
+          // теперь best-effort, но всё равно на всякий случай обернём —
+          // промах кеша не должен ломать основной флоу (FFmpeg загрузится
+          // просто медленнее в следующий раз, без кеширования).
+          try { await IDBCache.put(key, blob); } catch (e) {
+            console.warn('[vertcut] IDBCache.put failed for', key, e && e.message);
+          }
           out[key] = blob;
         }
         if (onProgress) onProgress(1);
@@ -1990,14 +1998,37 @@
           css.boxShadow = 'none';
         }
         // Позиция
-        css.bottom = ''; css.top = ''; css.transform = '';
+        // r12: css.transform = '' присваивает пустую строку, но CSS-класс
+        // .preview-sub содержит `transform: translateX(-50%)` — и эта
+        // inline-пустая строка НЕ перебивает class-правило. Нужно явно
+        // сбрасывать через 'none' чтобы не оставалось смещения -50%
+        // при posH='left'/'right'.
+        css.bottom = ''; css.top = ''; css.transform = 'none';
         if (style.posV === 'bottom') css.bottom = style.margin + '%';
         else if (style.posV === 'top') css.top = style.margin + '%';
         else { css.top = '50%'; css.transform = 'translate(-50%, -50%)'; }
         // Горизонталь
-        if (style.posH === 'left')  { css.left = style.margin + '%'; css.right = 'auto'; }
-        else if (style.posH === 'right') { css.right = style.margin + '%'; css.left = 'auto'; }
-        else { css.left = '50%'; css.right = 'auto'; if (!css.transform) css.transform = 'translateX(-50%)'; else css.transform = 'translate(-50%, -50%)'; }
+        if (style.posH === 'left')  {
+          css.left = style.margin + '%';
+          css.right = 'auto';
+          // Если posV=middle — translate(-50%, -50%) из блока выше уже
+          // учтён. Если top/bottom — нужно СБРОСИТЬ translateX(-50%) из
+          // CSS-класса, иначе саб будет смещён влево на 50% ширины.
+          if (style.posV !== 'middle') css.transform = 'none';
+        } else if (style.posH === 'right') {
+          css.right = style.margin + '%';
+          css.left = 'auto';
+          if (style.posV !== 'middle') css.transform = 'none';
+        } else {
+          // center
+          css.left = '50%';
+          css.right = 'auto';
+          if (style.posV === 'middle') {
+            css.transform = 'translate(-50%, -50%)';
+          } else {
+            css.transform = 'translateX(-50%)';
+          }
+        }
         return css;
       }
 
@@ -2090,6 +2121,50 @@
 
       function isAV1(codec) {
         return typeof codec === 'string' && codec.toLowerCase().startsWith('av01');
+      }
+
+      // r12: лёгкий сканер WebM/MKV (Matroska-based) на наличие AV1.
+      // MP4Box не парсит Matroska, поэтому для .webm/.mkv файлов probeCodec()
+      // вернёт null и приложение подумает, что файл не AV1 — и попытается
+      // скормить его напрямую в ffmpeg.wasm, который AV1 не умеет декодить.
+      //
+      // Эвристика: Matroska-контейнер начинается с EBML-магии 0x1A 0x45 0xDF 0xA3.
+      // Кодек видео хранится в CodecID-элементе (0x86) как UTF-8 строка,
+      // 'V_AV1' для AV1, 'V_VP9' для VP9, 'V_VP8' для VP8 и т.д.
+      // Ищем подстроку 'V_AV1' в первых ~2 MB файла — этого достаточно
+      // чтобы поймать Segment.Info → Track → CodecID (обычно в первых 50 KB).
+      async function probeCodecWebM(file) {
+        try {
+          const SLICE = Math.min(file.size, 2 * 1024 * 1024);
+          const blob = file.slice(0, SLICE);
+          const buf = new Uint8Array(await blob.arrayBuffer());
+          // Проверяем EBML magic
+          if (buf.length < 4 || buf[0] !== 0x1A || buf[1] !== 0x45 || buf[2] !== 0xDF || buf[3] !== 0xA3) {
+            return null; // не WebM/MKV
+          }
+          // ASCII-поиск подстроки 'V_AV1' / 'V_VP9' / 'V_VP8'
+          const dec = new TextDecoder('utf-8', { fatal: false });
+          const text = dec.decode(buf);
+          let videoCodec = null;
+          if (text.includes('V_AV1')) videoCodec = 'av01.0.000M.08';
+          else if (text.includes('V_VP9')) videoCodec = 'vp09.0.000.00';
+          else if (text.includes('V_VP8')) videoCodec = 'vp8';
+          else if (text.includes('V_MPEG4/ISO/AVC')) videoCodec = 'avc1';
+          else if (text.includes('V_MPEGH/ISO/HEVC')) videoCodec = 'hvc1';
+          if (!videoCodec) {
+            // WebM/MKV но кодек неизвестен — не наша проблема, пусть ffmpeg.wasm пробует
+            return { videoCodec: null, audioCodec: null, width: null, height: null, duration: null, container: 'webm' };
+          }
+          return {
+            videoCodec,
+            audioCodec: text.includes('A_OPUS') ? 'opus' : (text.includes('A_VORBIS') ? 'vorbis' : null),
+            width: null, height: null, duration: null,
+            container: 'webm',
+          };
+        } catch (e) {
+          console.warn('[vertcut] probeCodecWebM failed:', e);
+          return null;
+        }
       }
 
       // Извлекает avc1/hvc1/vpc/av1C-описание из stsd-бокса трека.
@@ -3580,7 +3655,7 @@
       // Build marker — если вы НЕ видите "[vertcut] build: r1" в консоли
       // при загрузке, значит у вас закеширован старый index.html.
       // Хард-рефреш: Ctrl+Shift+R.
-      console.log('%c[vertcut] build: r11 · auditfix', 'color:#ff3d6e;font-weight:bold');
+      console.log('%c[vertcut] build: r12 · auditfix2', 'color:#ff3d6e;font-weight:bold');
       console.log('[vertcut] document.body.dataset.build =', document.body.dataset.build);
 
       // SharedArrayBuffer fallback ----------------------------------------
@@ -3634,7 +3709,10 @@
         const av1 = Transcoder.isAV1(probe.videoCodec);
         codecBadgeEl.classList.toggle('is-warn', av1);
         if (av1) {
-          codecBadgeEl.innerHTML = `⚠️ Кодек видеотрека: <span class="codec-tag">${probe.videoCodec}</span> (AV1). FFmpeg.wasm не умеет его декодировать — при нажатии «Далее» браузер сам перекодирует видео в H.264 (~1× длительности ролика).`;
+          // r12: уточняем что контейнер WebM/MKV (Matroska-based) — WebCodecs
+          // умеет декодить AV1 нативно в любом контейнере.
+          const containerHint = probe.container === 'webm' ? ' (WebM/MKV)' : '';
+          codecBadgeEl.innerHTML = `⚠️ Кодек видеотрека: <span class="codec-tag">${probe.videoCodec}</span> (AV1${containerHint}). FFmpeg.wasm не умеет его декодировать — при нажатии «Далее» браузер сам перекодирует видео в H.264 (~1× длительности ролика).`;
         } else {
           codecBadgeEl.innerHTML = `Кодек видеотрека: <span class="codec-tag">${probe.videoCodec}</span> (совместим с FFmpeg.wasm).`;
         }
@@ -3665,9 +3743,15 @@
           previewBlock.classList.remove('hidden');
           updateClipsCountWarning();
           // Параллельно пробим кодек через MP4Box (фоновая задача — не блокирует UI).
-          // Если файл не MP4 (WebM/MOV/AVI) — probe вернёт null, считаем кодек неизвестным
-          // и пропускаем транскод (FFmpeg может справиться сам).
-          Transcoder.probeCodec(file).then((probe) => {
+          // r12: MP4Box парсит только ISO BMFF (MP4/MOV). Для WebM/MKV
+          // (Matroska-based) — отдельный сканер probeCodecWebM, иначе
+          // AV1 в WebM пройдёт мимо транскода и ffmpeg.wasm упадёт молча.
+          const ext = (file.name.split('.').pop() || '').toLowerCase();
+          const isMatroska = ext === 'webm' || ext === 'mkv';
+          const probePromise = isMatroska
+            ? Transcoder.probeCodecWebM(file)
+            : Transcoder.probeCodec(file);
+          probePromise.then((probe) => {
             if (AppState.inputFile !== file) return; // сменили файл пока пробили
             AppState.inputCodecProbe = probe;
             renderCodecBadge(probe);
@@ -3722,8 +3806,23 @@
       async function maybeTranscodeThenSettings() {
         if (!AppState.inputFile) return;
 
-        const probe = AppState.inputCodecProbe;
-        const needTranscode = probe && Transcoder.isAV1(probe.videoCodec);
+        // r12: reentrancy-guard. Без этого двойной клик по «Далее» запускает
+        // два параллельных транскода: два экземпляра muxer, два VideoDecoder'а,
+        // две гонки за pumpDone — в лучшем случае дублирование чанков в
+        // выходном MP4, в худшем — крэш IndexedDB при конкурентных writeFile.
+        // Ставим флаг ДО любого await, чтобы перекрыть окно между стартом и
+        // созданием transcodeAbort (~30мс в случае isConfigSupported).
+        if (AppState.transcodingInProgress) {
+          console.warn('[vertcut] btn-go-settings: transcode already in progress, ignoring click');
+          UI.toast('Идёт конвертация — дождитесь завершения', 'warn');
+          return;
+        }
+        AppState.transcodingInProgress = true;
+
+        // r12: try/finally гарантирует снятие флага при ЛЮБОМ exit (success,
+        // catch, ранний return на error/no-codec). Без finally ошибка в
+        // remux или transcodeAV1ToH264 навсегда заблокировала бы кнопку.
+        try {
 
         if (!needTranscode) {
           UI.show('settings');
@@ -3777,6 +3876,63 @@
         }
         if ('Notification' in window && Notification.permission === 'default') {
           try { await Notification.requestPermission(); } catch (_) {}
+        }
+
+        // r12: WebM/MKV-AV1 — пре-шаг remux контейнера (без перекодирования).
+        // transcodeAV1ToH264 использует MP4Box для demux, а MP4Box не парсит
+        // Matroska. Поэтому сначала пересобираем контейнер в MP4 (только
+        // перенос потоков, кодеки сохраняются) — это быстро, ~1-3 секунды.
+        let transcodingFile = AppState.inputFile;
+        if (probe && probe.container === 'webm' && probe.videoCodec && Transcoder.isAV1(probe.videoCodec)) {
+          setTransProgress(0, 'Remux WebM → MP4 (без перекодирования)…');
+          try {
+            await FFmpegCore.init(() => { /* init без progress — мы ещё не на processing */ });
+            const inputName = 'webm_in.' + (AppState.inputFile.name.split('.').pop() || 'webm').toLowerCase();
+            const outputName = 'webm_out.mp4';
+            const buf = new Uint8Array(await AppState.inputFile.arrayBuffer());
+            await FFmpegCore.writeFile(inputName, buf);
+            // -c copy = stream copy (без перекодирования), -map 0 = все потоки.
+            // Это просто пересборка контейнера, никакой потери качества.
+            const remuxArgs = ['-i', inputName, '-c', 'copy', '-map', '0', outputName];
+            // r12: onProgress — FFmpeg даёт ratio по времени, не по байтам,
+            // но для remux это обычно < 1с на гигабайт, точность не критична.
+            let remuxProgressLast = 0;
+            const remuxOff = EventBus.on('ffmpeg:progress', (p) => {
+              if (typeof p.ratio === 'number' && p.ratio > remuxProgressLast) {
+                remuxProgressLast = p.ratio;
+                // remux = 0..10% от общего прогресса (он быстрый)
+                setTransProgress(0.05 * Math.min(1, p.ratio), `Remux WebM → MP4 · ${Math.round(p.ratio * 100)}%`);
+              }
+            });
+            try {
+              await FFmpegCore.run(remuxArgs);
+            } finally {
+              remuxOff();
+            }
+            const remuxed = await FFmpegCore.readFile(outputName);
+            if (!remuxed || remuxed.byteLength === 0) {
+              throw new Error('FFmpeg вернул пустой файл при remux WebM → MP4');
+            }
+            // Чистим FS
+            try { await FFmpegCore.unlink(inputName); } catch (_) {}
+            try { await FFmpegCore.unlink(outputName); } catch (_) {}
+            // Подменяем файл: новый File c тем же baseName + '_remuxed.mp4'
+            const baseName = (AppState.inputFile.name || 'input').replace(/\.[^.]+$/, '');
+            transcodingFile = new File([remuxed.buffer], `${baseName}_remuxed.mp4`, { type: 'video/mp4' });
+            // r12: НЕ ставим transcodingFile в AppState.inputFile (это сделает
+            // success-handler ниже), но обновим codec probe на новый файл
+            // (он тоже MP4, MP4Box справится).
+            AppState.inputCodecProbe = null;
+            setTransProgress(0.1, 'Remux готов, запускаем AV1 → H.264…');
+            console.log('[vertcut] WebM-AV1 remuxed to MP4:', transcodingFile.size, 'bytes');
+          } catch (e) {
+            console.error('[vertcut] WebM remux failed:', e);
+            UI.toast('Не удалось remux WebM → MP4: ' + (e.message || e) + '. Конвертируйте видео локально.', 'error', 6000);
+            notifySw(false, 0, 'error');
+            window.removeEventListener('beforeunload', unloadHandler);
+            UI.show('upload');
+            return;
+          }
         }
 
         const abort = new AbortController();
@@ -3859,7 +4015,7 @@
 
         try {
           const newFile = await Transcoder.transcodeAV1ToH264(
-            AppState.inputFile,
+            transcodingFile, // r12: для WebM-AV1 это уже remuxed MP4, иначе AppState.inputFile
             (p, phase) => {
               const now = performance.now();
               const elapsedSec = (now - t0) / 1000;
@@ -4014,10 +4170,23 @@
           }
           UI.show('upload');
         }
+        } finally {
+          AppState.transcodingInProgress = false;
+        }
       }
 
       document.getElementById('btn-go-settings').addEventListener('click', () => {
         if (!AppState.inputFile) return;
+        // r12: defense-in-depth против слишком короткого видео. Кнопка уже
+        // disabled через updateClipsCountWarning, но между моментом загрузки
+        // файла и моментом когда metadata распарсилась есть окно, когда
+        // dur === 0. Проверяем ещё раз здесь на случай race condition.
+        const dur = AppState.inputMeta?.duration || 0;
+        const len = AppState.settings.clipLength;
+        if (dur > 0 && dur < len) {
+          UI.toast(`Видео короче ${len}s — уменьшите длину клипа`, 'warn');
+          return;
+        }
         maybeTranscodeThenSettings();
       });
 
@@ -4116,6 +4285,35 @@
         const dur = AppState.inputMeta?.duration || 0;
         const len = AppState.settings.clipLength;
         const banner = document.getElementById('warn-banner');
+        const btn = document.getElementById('btn-go-settings');
+        // r12: жёсткая блокировка «Далее» если видео короче одного клипа.
+        // Раньше Math.max(1, ...) маскировало 0 → кнопка оставалась активна,
+        // переход в settings, потом в processing, там пайплайн выдавал 0
+        // samples или молчаливый «0 клипов готов».
+        const videoTooShort = dur > 0 && dur < len;
+        if (videoTooShort) {
+          banner.classList.add('is-visible');
+          banner.textContent = `Видео короче длины одного клипа (${dur.toFixed(1)}s < ${len}s). Уменьшите длину клипа до ≤${Math.floor(dur)}s или загрузите более длинный ролик.`;
+          // r12: блокируем переход в настройки — там нечего делать без
+          // хотя бы одного полного клипа. Defense-in-depth: и в хендлере
+          // проверяем isTooShortVideo(), но disabled + tooltip — UX-чище.
+          if (btn) {
+            btn.disabled = true;
+            btn.title = `Видео короче ${len}s — уменьшите длину клипа`;
+          }
+          // r12: сбрасываем clipsCount в 0 чтобы startProcessing() сразу
+          // увидел «нечего нарезать» и показал чистый error, а не молчание.
+          if (AppState.settings.clipsCount !== 0) {
+            AppState.settings.clipsCount = 0;
+            if (sliderCount) sliderCount.value = 0;
+            if (valCount) valCount.textContent = '0';
+          }
+          return;
+        }
+        if (btn) {
+          btn.disabled = false;
+          btn.title = '';
+        }
         const max = Math.max(1, Math.floor(dur / len));
         const adjusted = validateClipsCount();
         if (adjusted !== AppState.settings.clipsCount) {
